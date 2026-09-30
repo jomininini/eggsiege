@@ -1,10 +1,10 @@
 import type { Audio } from '../engine/audio'
 import type { SaveData, SaveStore } from '../engine/save'
-import { CONFIG, DIFFICULTY, DIFFICULTY_ORDER, difficultyName, launcherName, PLAYER_TEAM, RT, TEAM_CSS, teamName, teamShort, weaponName, type Difficulty } from '../game/config'
+import { CONFIG, DIFFICULTY, DIFFICULTY_ORDER, difficultyName, launcherName, pistolName, PLAYER_TEAM, RT, TEAM_CSS, teamName, teamShort, weaponName, type Difficulty } from '../game/config'
 import type { FeedEntry, Game, MatchResult, Marker, Toast } from '../game/game'
 import { getLang, L, onLang, T } from '../game/i18n'
 import {
-  BASES, BRIDGES, BUILDINGS, CANAL, DRONE_PADS, EMPLACEMENTS, HELIPADS, ISLAND, ISLAND_POINT, LAKE, LAND, POINTS, pointName, pointShort, ROADS, SEA, SHORE_Z, SKILLS,
+  BASES, BRIDGES, BUILDINGS, CANAL, DRONE_PADS, EMPLACEMENTS, HELIPADS, ISLAND, ISLAND_DEPOT, ISLAND_POINT, LAKE, LAND, POINTS, pointName, pointShort, ROADS, SEA, SHORE_Z, SKILLS,
   STATIONS, type SkillId,
 } from '../game/map'
 import { eggIndex, formatClock } from '../game/rules'
@@ -28,8 +28,8 @@ const controls = (): [string, string][] => [
   [L('鼠标', 'Mouse'), L('瞄准视角', 'Aim')],
   [L('左键', 'LMB'), L('射击 / 发射', 'Fire / launch')],
   [L('右键', 'RMB'), L('机瞄；导弹持续瞄准载具与飞行器即可锁定', 'Aim down sights; hold on a vehicle or aircraft to lock the missile')],
-  ['Q / 1 · 2', L('切换 KT-9 步枪 / 飞鱼-2 便携导弹', 'Switch KT-9 rifle / Flyfish-2 missile')],
-  ['R', L('换弹 / 装填导弹', 'Reload rifle / missile')],
+  ['Q / 1 · 2 · 3', L('切换 KT-9 步枪 / P-7 手枪（无限备弹）/ 飞鱼-2 便携导弹', 'Switch KT-9 rifle / P-7 sidearm (unlimited spares) / Flyfish-2 missile')],
+  ['R', L('换弹（手枪也需换弹）/ 装填导弹', 'Reload (the sidearm too) / load missile')],
   ['Shift', L('冲刺 / 无人机加速', 'Sprint / drone boost')],
   [L('空格', 'Space'), L('跳跃', 'Jump')],
   ['C / Ctrl', L('蹲伏（更稳）', 'Crouch (steadier)')],
@@ -46,7 +46,7 @@ const legend = (): [string, string, string][] => [
   ['#ffd35c', L('金蛋 · 主控点', 'Golden Egg · main objective'), L(`中央高锟会议中心，脚下是连通大海的金蛋湖。占领每秒 +${CONFIG.match.tick.egg} 分，守满 ${CONFIG.match.eggHoldToWin} 秒直接获胜。`, `The central convention centre above the Egg Lake, linked to the sea by a canal. +${CONFIG.match.tick.egg}/s while held; keep it ${CONFIG.match.eggHoldToWin}s to win outright.`)],
   ['#e8edf2', L('A B C D 建筑据点', 'A B C D building points'), L('机器人中心、InnoCell、5E、大展览厅，每秒 +1 分。', 'Robotics Centre, InnoCell, 5E and the Exhibition Hall, +1/s each.')],
   ['#39d6c8', L('出海岛（出海模式）', 'Offshore Isle (sea mode)'), L('离岸小岛：占领后获得海盾防空炮、潮汐远程火箭炮与巡逻艇，并可在岛上重生。', 'An island just offshore: holding it grants the Sea Shield AA gun, Tide rocket battery, patrol boats and an island respawn.')],
-  ['#ffa94d', L('餐厅 · 补给点', 'Canteens · resupply'), L('补满弹药，手雷 +2，便携导弹 +2。', 'Full ammo, +2 grenades, +2 missiles.')],
+  ['#ffa94d', L('餐厅 · 补给点', 'Canteens · resupply'), L('补满弹药，手雷 +2，便携导弹 +2。部署区缓慢补弹；出海模式占岛后岛上弹药库快速补弹。', 'Full ammo, +2 grenades, +2 missiles. The staging area tops up slowly; in sea mode the isle ammo depot refills fast for its holder.')],
   ['#9d8cff', L('科技公司 · 技能点', 'Tech firms · skills'), L('量子扫描、纳米护盾、智能稳定、神经加速，持续 22 秒。', 'Quantum scan, nano shield, smart stabiliser or neural rush for 22s.')],
   ['#5cff9d', L('会所 · 回血点', 'Clubhouse · healing'), L('站在会所泳池平台上持续恢复生命。', 'Stand on the clubhouse pool deck to regenerate.')],
   ['#7ef9ff', L('屋顶无人机坪', 'Rooftop drone pads'), L('10W、20E 屋顶，俯视侦察并标记敌人，可呼叫直升机与火箭炮。', '10W and 20E rooftops: scout from above, mark enemies, call the heli and rocket strikes.')],
@@ -72,6 +72,8 @@ export class Ui {
   private markerPool: HTMLDivElement[] = []
   private cache = new Map<string, string>()
   private hitTimer = 0
+  /** Briefing panel minimised (session only — it always opens expanded on load). */
+  private briefMin = false
   private miniTick = 0
   private bootProgress = 0
   private lastEnd?: MatchResult
@@ -178,7 +180,8 @@ export class Ui {
       <div class="brand-en">${getLang() === 'en' ? '<b>GOLDEN EGG SIEGE</b><span>SCIENCE PARK FRONT</span>' : ''}</div>
       <div class="title-wrap">
         <div class="brief panel">
-          <div class="panel-h">${L('任务简报', 'Mission briefing')} ${this.langToggle()}</div>
+          <div class="panel-h">${L('任务简报', 'Mission briefing')} ${this.langToggle()}<button class="min" data-a="min" title="${L('最小化 / 展开简报', 'Minimise / expand briefing')}"><span class="mi">–</span><span class="mx">${L('展开', 'Expand')}</span></button></div>
+          <div class="brief-body">
           <p>${L(
             `吐露港畔的创科园区被划为演习战区。<b class="r">红方 · 赤焰</b> 与 <b class="b">蓝方 · 海鹰</b> 围绕据点展开争夺——核心是园区中央、十根白柱托起的<b class="g">金蛋</b>。`,
             `The waterfront innovation park is now a live-fire exercise zone. <b class="r">Red · Blaze</b> and <b class="b">Blue · Sea Hawk</b> fight over its objectives — above all the <b class="g">Golden Egg</b> raised on ten white columns.`,
@@ -197,13 +200,14 @@ export class Ui {
             <div class="opt"><span>${L('游戏难度', 'Difficulty')}</span><div class="seg">${DIFFICULTY_ORDER.map(k => `<button data-diff="${k}" class="${d.difficulty === k ? 'on' : ''}">${difficultyName(k)}</button>`).join('')}</div></div>
             <div class="diff-desc">${diffDesc(d.difficulty)}</div>
           </div>
+          </div>
           <div class="btns">
             <button class="btn primary" data-a="play">${L('开始作战', 'Deploy')}</button>
             <button class="btn" data-a="howto">${L('操作与地图说明', 'Controls & map')}</button>
             <button class="btn" data-a="settings">${L('设置', 'Settings')}</button>
           </div>
-          <div class="career"></div>
-          <div class="hint">${L('点击“开始作战”后鼠标将被锁定用于瞄准，按 Esc 可随时暂停。', 'After “Deploy” the mouse is captured for aiming; press Esc to pause at any time.')}</div>
+          <div class="brief-body2"><div class="career"></div>
+          <div class="hint">${L('点击“开始作战”后鼠标将被锁定用于瞄准，按 Esc 可随时暂停。', 'After “Deploy” the mouse is captured for aiming; press Esc to pause at any time.')}</div></div>
         </div>
       </div>
       <div class="modal howto">
@@ -220,6 +224,13 @@ export class Ui {
         </div>
       </div>
       <div class="modal settings-m"><div class="panel">${this.settingsHtml()}<div class="btns"><button class="btn primary" data-a="close">${L('完成', 'Done')}</button></div></div></div>`
+    const brief = s.querySelector<HTMLElement>('.brief')!
+    if (this.briefMin) brief.classList.add('mini')
+    s.querySelector('[data-a=min]')!.addEventListener('click', () => {
+      this.click()
+      this.briefMin = !this.briefMin
+      brief.classList.toggle('mini', this.briefMin)
+    })
     s.querySelector('[data-a=play]')!.addEventListener('click', () => {
       this.click()
       this.actions.play()
@@ -400,7 +411,8 @@ export class Ui {
         <div class="buffs"></div>
       </div>
       <div class="ammo">
-        <div class="slots"><span class="s1"><kbd>1</kbd>${L('步枪', 'Rifle')}</span><span class="s2"><kbd>2</kbd>${L('导弹', 'Missile')}</span></div>
+        <div class="ammo-warn"><i class="arr">▲</i><span></span></div>
+        <div class="slots"><span class="s1"><kbd>1</kbd>${L('步枪', 'Rifle')}</span><span class="s2"><kbd>2</kbd>${L('手枪', 'Pistol')}</span><span class="s3"><kbd>3</kbd>${L('导弹', 'Missile')}</span></div>
         <div class="wname">${weaponName()}</div>
         <div class="ammo-row"><b class="mag">30</b><span class="res">/ 150</span></div>
         <div class="gren"><span>${L('手雷', 'Grenades')}</span><b class="gn">2</b><span>${L('导弹', 'Missiles')}</span><b class="rk">1</b><span class="reload">${L('装填中…', 'Reloading…')}</span></div>
@@ -413,7 +425,7 @@ export class Ui {
       capFill: q('.cap-track i'), capState: q('.cap-state'), prompt: q('.prompt'), respawn: q('.respawn'), respawnT: q('.respawn span'), rspOpt: q('.rsp-opt'), hp: q('.hp'),
       hpfill: q('.hpfill'), shfill: q('.shfill'), buffs: q('.buffs'), mag: q('.mag'), res: q('.res'), gn: q('.gn'), rk: q('.rk'), reload: q('.reload'), wname: q('.wname'),
       slots: q('.slots'), markers: q('.markers'), lowhp: q('.lowhp'), drone: q('.drone-fx'), aa: q('.aa-fx'), aaMode: q('.aa-mode'), aaLock: q('.aa-fx .lockring'),
-      arty: q('.arty-fx'), artyCard: q('.arty-card'), board: q('.scoreboard'), chips: q('.chips'), ammo: q('.ammo'),
+      arty: q('.arty-fx'), artyCard: q('.arty-card'), board: q('.scoreboard'), chips: q('.chips'), ammo: q('.ammo'), awarn: q('.ammo-warn'), awarnT: q('.ammo-warn span'), awarnA: q('.ammo-warn .arr'),
     }
     this.mini = q<HTMLCanvasElement>('.minimap canvas')
     this.syncModeHud()
@@ -557,7 +569,8 @@ export class Ui {
     this.set('buffs', h.buffs, buffs.map(k => `<div class="buff" style="--c:${SKILLS[k].color}"><b>${T(SKILLS[k].name)}</b><span>${Math.ceil(p.buffs[k] - t)}s</span></div>`).join('') + (t < p.spawnShieldUntil ? `<div class="buff" style="--c:#fff"><b>${L('部署保护', 'Spawn shield')}</b></div>` : ''))
     // Weapon panel.
     const launcher = p.weapon === 'launcher'
-    h.slots.className = `slots ${launcher ? 'w2' : 'w1'}`
+    const pistol = p.weapon === 'pistol'
+    h.slots.className = `slots ${launcher ? 'w3' : pistol ? 'w2' : 'w1'}`
     h.slots.style.display = veh || seat ? 'none' : ''
     if (veh) {
       this.set('wname', h.wname, L(`${veh.label} · 车载机枪`, `${veh.label} · mounted gun`))
@@ -580,13 +593,33 @@ export class Ui {
       this.set('mag', h.mag, String(p.rocket))
       this.set('res', h.res, `/ ${p.rocketReserve}`)
       h.ammo.className = 'ammo launcher'
+    } else if (pistol) {
+      this.set('wname', h.wname, pistolName())
+      this.set('mag', h.mag, String(p.pmag))
+      this.set('res', h.res, '/ ∞')
+      h.ammo.className = 'ammo pistol'
     } else {
       this.set('wname', h.wname, weaponName())
       this.set('mag', h.mag, String(p.mag))
       this.set('res', h.res, `/ ${Math.floor(p.reserve)}`)
       h.ammo.className = 'ammo'
     }
-    h.mag.classList.toggle('low', !veh && !seat && (launcher ? p.rocket === 0 : p.mag <= 8))
+    h.res.classList.toggle('low', !veh && !seat && !launcher && !pistol && p.reserve < CONFIG.lowReserve)
+    h.mag.classList.toggle('low', !veh && !seat && (launcher ? p.rocket === 0 : pistol ? p.pmag <= 3 : p.mag <= 8))
+    // Rifle ammo warning with a bearing to the nearest resupply point.
+    const ast = alive && !veh && !seat && p.mode === 'foot' ? g.ammoState : ''
+    h.awarn.className = `ammo-warn ${ast}`
+    if (ast) {
+      const best = g.ammoPoints()[0]
+      if (best) {
+        const dx = best.x - p.pos.x, dz = best.z - p.pos.z
+        const sy = Math.sin(p.yaw), cy = Math.cos(p.yaw)
+        const rel = Math.atan2(dx * cy - dz * sy, -dx * sy - dz * cy)
+        h.awarnA.style.transform = `rotate(${rel.toFixed(2)}rad)`
+        const head = ast === 'dry' ? L('步枪弹药耗尽', 'Rifle dry') : L('步枪备弹不足', 'Rifle ammo low')
+        this.set('awarn', h.awarnT, best.d < 5 ? L(`${head} · 已到达${best.name}`, `${head} · at ${best.name}`) : L(`${head} → ${best.name} ${Math.round(best.d)} 米`, `${head} → ${best.name} ${Math.round(best.d)} m`))
+      }
+    }
     this.set('gn', h.gn, String(p.grenades))
     this.set('rk', h.rk, String(p.rocket + p.rocketReserve))
     h.reload.classList.toggle('on', !veh && !seat && p.reloading)
@@ -744,6 +777,7 @@ export class Ui {
     }
     const en = getLang() === 'en'
     for (const s of STATIONS) icon(s.x, s.z, s.kind === 'supply' ? '#ffa94d' : s.kind === 'heal' ? '#5cff9d' : SKILLS[s.skill!].color, s.kind === 'supply' ? (en ? 'S' : '补') : s.kind === 'heal' ? (en ? '+' : '血') : (en ? 'K' : '技'))
+    if (RT.sea) icon(ISLAND_DEPOT.x, ISLAND_DEPOT.z, '#ffa94d', en ? 'S' : '补')
     for (const d of DRONE_PADS) icon(d.x, d.z, '#7ef9ff', '◇')
     for (const h of HELIPADS) icon(h.x, h.z, h.team === 0 ? '#ff8a96' : '#8ccaff', 'H')
     return c

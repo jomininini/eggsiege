@@ -144,6 +144,16 @@ export class Bot implements Unit {
     this.boardTarget = null
     this.sheltered = false
     this.nextThink = 0
+    // Clear every time gate: the match clock restarts at 0 each match.
+    this.nextShot = 0
+    this.burstLeft = 0
+    this.reactUntil = 0
+    this.strafeUntil = 0
+    this.nextWander = 0
+    this.stuckCheck = 0
+    this.fleeUntil = 0
+    this.respawnAt = 0
+    this.spottedUntil = 0
     this.missileAt = host.time + rnd(RT.bot.missileCd[0], RT.bot.missileCd[1]) * 0.5
     this.spawnShieldUntil = host.time + CONFIG.player.spawnShield
     this.yaw = this.team === 0 ? Math.PI / 2 : -Math.PI / 2

@@ -7,7 +7,8 @@ import { isWater, LAND, SEA, type SkillId } from './map'
 import type { Unit } from './units'
 
 export type PlayerMode = 'foot' | 'vehicle' | 'drone' | 'heli' | 'aa' | 'arty' | 'dead'
-export type WeaponSlot = 'rifle' | 'launcher'
+export type WeaponSlot = 'rifle' | 'pistol' | 'launcher'
+export const WEAPON_ORDER: WeaponSlot[] = ['rifle', 'pistol', 'launcher']
 
 /** The local player: FPS movement, weapon state, buffs and stats. */
 export class Player implements Unit {
@@ -57,6 +58,8 @@ export class Player implements Unit {
   ads = 0
   /** Active weapon: KT-9 rifle or the Flyfish-2 guided missile launcher. */
   weapon: WeaponSlot = 'rifle'
+  /** Sidearm magazine; its spare ammo is unlimited. */
+  pmag: number = CONFIG.pistol.mag
   rocket = 1
   rocketReserve: number = CONFIG.launcher.reserve
   rocketReloadUntil = 0
@@ -78,8 +81,12 @@ export class Player implements Unit {
     this.mode = 'foot'
     this.mag = CONFIG.weapon.mag
     this.reserve = CONFIG.weapon.reserve
+    this.pmag = CONFIG.pistol.mag
     this.grenades = Math.max(this.grenades, CONFIG.grenade.start)
     this.reloadUntil = 0
+    // Time-based gates must be cleared: the match clock restarts at 0 on every new match.
+    this.nextFire = 0
+    this.spottedUntil = 0
     this.bloom = 0
     this.crouch = false
     this.weapon = 'rifle'
@@ -97,6 +104,10 @@ export class Player implements Unit {
     this.kills = this.deaths = this.captures = this.shots = this.hits = this.headshots = this.damageDealt = 0
     this.grenades = CONFIG.grenade.start
     this.rocketReserve = CONFIG.launcher.reserve
+  }
+  /** Rifle completely dry (magazine and reserve). */
+  get rifleDry(): boolean {
+    return this.mag <= 0 && this.reserve < 1
   }
   get reloading(): boolean {
     return this.weapon === 'launcher' ? this.rocketReloadUntil > 0 : this.reloadUntil > 0
@@ -208,18 +219,29 @@ export class Player implements Unit {
       }
     }
     if (this.reloadUntil > 0 && time >= this.reloadUntil) {
+      this.reloadUntil = 0
+      if (this.weapon === 'pistol') {
+        this.pmag = CONFIG.pistol.mag
+        return true
+      }
       const need = w.mag - this.mag
-      const take = Math.min(need, this.reserve)
+      const take = Math.max(0, Math.min(need, Math.floor(this.reserve)))
       this.mag += take
       this.reserve -= take
-      this.reloadUntil = 0
       return true
     }
     return false
   }
 
   startReload(time: number): boolean {
-    if (this.reloading || this.mag >= CONFIG.weapon.mag || this.reserve <= 0) return false
+    if (this.weapon === 'launcher') return this.startRocketReload(time)
+    if (this.reloading) return false
+    if (this.weapon === 'pistol') {
+      if (this.pmag >= CONFIG.pistol.mag) return false
+      this.reloadUntil = time + CONFIG.pistol.reload
+      return true
+    }
+    if (this.mag >= CONFIG.weapon.mag || this.reserve < 1) return false
     this.reloadUntil = time + CONFIG.weapon.reload
     return true
   }
@@ -228,7 +250,7 @@ export class Player implements Unit {
   spread(time: number): number {
     const w = CONFIG.weapon
     const hs = Math.hypot(this.vel.x, this.vel.z)
-    let s = w.spread + this.bloom
+    let s = (this.weapon === 'pistol' ? CONFIG.pistol.spread : w.spread) + this.bloom
     if (this.mode === 'foot') {
       s += Math.min(1, hs / CONFIG.player.walk) * w.moveSpread * (this.crouch ? 0.5 : 1)
       if (!this.onGround && !this.wading) s += w.airSpread
@@ -241,12 +263,13 @@ export class Player implements Unit {
 
   applyRecoil(time: number): void {
     const w = CONFIG.weapon
+    const r = this.weapon === 'pistol' ? CONFIG.pistol : w
     const m = this.buff('steady', time) ? 0.35 : 1
     const k = (1 - this.ads * 0.3) * m
-    this.kick += w.recoilPitch * k
-    this.kickYaw += (Math.random() - 0.5) * w.recoilYaw * 2 * k
-    this.pitch = Math.min(1.5, this.pitch + w.recoilPitch * 0.35 * k)
-    this.bloom = Math.min(w.bloomMax, this.bloom + w.bloomPerShot * m)
+    this.kick += r.recoilPitch * k
+    this.kickYaw += (Math.random() - 0.5) * r.recoilYaw * 2 * k
+    this.pitch = Math.min(1.5, this.pitch + r.recoilPitch * 0.35 * k)
+    this.bloom = Math.min(w.bloomMax, this.bloom + r.bloomPerShot * m)
   }
 
   get speed(): number {
@@ -262,9 +285,12 @@ export class ViewModel {
   readonly group = new THREE.Group()
   private readonly gun = new THREE.Group()
   private readonly tube = new THREE.Group()
+  private readonly pistol = new THREE.Group()
+  private readonly pistolFlash: THREE.Sprite
+  private readonly slide: THREE.Mesh
   private readonly lockLamp: THREE.MeshBasicMaterial
   private swapT = 0
-  private shown: 'rifle' | 'launcher' = 'rifle'
+  private shown: WeaponSlot = 'rifle'
   private readonly flash: THREE.Sprite
   private readonly mag: THREE.Mesh
   private flashT = 0
@@ -357,6 +383,31 @@ export class ViewModel {
     })
     this.tube.visible = false
     this.group.add(this.tube)
+    // P-7 sidearm.
+    const pbox = (mat: THREE.Material, w: number, h: number, d: number, x: number, y: number, z: number) => {
+      const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat)
+      mesh.position.set(x, y, z)
+      this.pistol.add(mesh)
+      return mesh
+    }
+    this.slide = pbox(mid, 0.06, 0.06, 0.3, 0, 0.03, -0.26)
+    pbox(dark, 0.055, 0.04, 0.26, 0, -0.015, -0.25)
+    pbox(glow, 0.062, 0.01, 0.2, 0, 0.062, -0.26)
+    pbox(dark, 0.05, 0.13, 0.065, 0, -0.08, -0.16).rotation.x = -0.25
+    pbox(glove, 0.075, 0.09, 0.1, 0, -0.1, -0.15)
+    pbox(sleeve, 0.09, 0.09, 0.26, 0.02, -0.13, -0.0).rotation.x = 0.25
+    this.pistolFlash = new THREE.Sprite(this.flash.material)
+    this.pistolFlash.scale.setScalar(0.2)
+    this.pistolFlash.position.set(0, 0.03, -0.47)
+    this.pistolFlash.visible = false
+    this.pistol.add(this.pistolFlash)
+    this.pistol.traverse(o => {
+      o.frustumCulled = false
+    })
+    this.pistol.visible = false
+    this.pistol.scale.setScalar(0.62)
+    this.pistol.position.set(0.01, 0.02, -0.02)
+    this.group.add(this.pistol)
     this.group.scale.setScalar(0.34)
   }
 
@@ -372,7 +423,7 @@ export class ViewModel {
 
   /** Muzzle position in world space (for tracers). */
   muzzle(out: THREE.Vector3): THREE.Vector3 {
-    return this.flash.getWorldPosition(out)
+    return (this.pistol.visible ? this.pistolFlash : this.flash).getWorldPosition(out)
   }
 
   update(dt: number, p: Player, lookDx: number, lookDy: number, time: number, visible: boolean): void {
@@ -383,6 +434,7 @@ export class ViewModel {
       this.swapT = 1
       this.gun.visible = p.weapon === 'rifle'
       this.tube.visible = p.weapon === 'launcher'
+      this.pistol.visible = p.weapon === 'pistol'
     }
     this.swapT = Math.max(0, this.swapT - dt * 3)
     const ads = p.ads
@@ -406,8 +458,8 @@ export class ViewModel {
       rx -= 0.25
       rz = 0.35
     }
-    if (p.reloading) {
-      const k = 1 - Math.max(0, (p.reloadUntil - time) / CONFIG.weapon.reload)
+    if (p.reloading && p.weapon !== 'launcher') {
+      const k = 1 - Math.max(0, (p.reloadUntil - time) / (p.weapon === 'pistol' ? CONFIG.pistol.reload : CONFIG.weapon.reload))
       const dip = Math.sin(Math.min(1, k) * Math.PI)
       pos.y -= dip * 0.04
       rx -= dip * 0.5
@@ -421,12 +473,19 @@ export class ViewModel {
         pos.y -= Math.sin(Math.min(1, k) * Math.PI) * 0.06
       }
     }
+    if (p.weapon === 'pistol') {
+      pos.x -= 0.02 * (1 - ads)
+      pos.z += 0.03
+      this.slide.position.z = -0.26 + this.kickT * 0.05
+    }
     pos.y -= this.swapT * 0.08
     this.tube.rotation.x = this.gun.rotation.x * 0.5
+    this.pistol.rotation.copy(this.gun.rotation)
     this.group.position.lerp(pos, Math.min(1, dt * 18))
     this.gun.rotation.x += (rx - this.gun.rotation.x) * Math.min(1, dt * 14)
     this.gun.rotation.z += (rz - this.gun.rotation.z) * Math.min(1, dt * 10)
     this.flashT -= dt
-    this.flash.visible = this.flashT > 0
+    this.flash.visible = this.flashT > 0 && this.gun.visible
+    this.pistolFlash.visible = this.flashT > 0 && this.pistol.visible
   }
 }

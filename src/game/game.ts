@@ -4,19 +4,19 @@ import type { Input } from '../engine/input'
 import type { Renderer } from '../engine/renderer'
 import { Bot, type BotHost, type SeekerSpec, type Target } from './bots'
 import { raySphere } from './collide'
-import { applyOptions, CONFIG, launcherName, PLAYER_TEAM, RT, teamShort, weaponName, type MatchOptions } from './config'
+import { applyOptions, CONFIG, launcherName, pistolName, PLAYER_TEAM, RT, teamShort, weaponName, type MatchOptions } from './config'
 import { Drone, ScoutDrone } from './drone'
 import { Emplacement } from './emplace'
 import { Fx } from './fx'
 import { Heli, type HeliHost } from './heli'
 import { L } from './i18n'
 import {
-  BASES, BOAT_SPAWNS, CAR_SPAWNS, DRONE_PADS, EGG, EMPLACEMENTS, HELIPADS, ISLAND, ISLAND_BOATS, ISLAND_POINT, LAND, POINTS, SHORE_Z, SKILLS,
+  BASES, BOAT_SPAWNS, CAR_SPAWNS, DRONE_PADS, EGG, EMPLACEMENTS, HELIPADS, ISLAND, ISLAND_BOATS, ISLAND_DEPOT, ISLAND_POINT, LAND, POINTS, SHORE_Z, SKILLS,
   STATIONS, WATER_Y, heliTargets, isWater, pointName, pointShort, stationName, type SkillId,
 } from './map'
 import { NavGrid } from './nav'
 import { Ordnance, type OrdnanceHost, type Projectile } from './ordnance'
-import { Player, ViewModel } from './player'
+import { Player, ViewModel, WEAPON_ORDER, type WeaponSlot } from './player'
 import { addKill, createMatch, eggIndex, stepPoint, tickMatch, type EndReason, type MatchState } from './rules'
 import { rayUnit, type Shooter, type Unit } from './units'
 import { Vehicle } from './vehicles'
@@ -94,6 +94,8 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
   prompt = ''
   heliMenu = false
   respawnIsland = false
+  private ammoAcc = 0
+  private depotMissileAcc = 0
   private idleSince = new Map<Vehicle, number>()
   air: Target[] = []
   hard: Target[] = []
@@ -208,6 +210,11 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
     this.cursorRing.visible = false
     this.heliMenu = false
     this.respawnIsland = false
+    this.ammoAcc = 0
+    this.ammoHintAt = -99
+    this.lockBeepAt = 0
+    this.healSoundAt = 0
+    for (const u of this.units) u.spottedUntil = 0
     for (const b of this.bots) {
       b.kills = b.deaths = b.captures = 0
       b.spawn(this)
@@ -407,11 +414,12 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
   private handleWeaponKeys(): void {
     const p = this.player
     const input = this.input
-    let to: 'rifle' | 'launcher' | null = null
-    if (input.consume('swap')) to = p.weapon === 'rifle' ? 'launcher' : 'rifle'
+    let to: WeaponSlot | null = null
+    if (input.consume('swap')) to = WEAPON_ORDER[(WEAPON_ORDER.indexOf(p.weapon) + 1) % WEAPON_ORDER.length]
     if (!this.heliMenu) {
       if (input.consume('n1')) to = 'rifle'
-      if (input.consume('n2')) to = 'launcher'
+      if (input.consume('n2')) to = 'pistol'
+      if (input.consume('n3')) to = 'launcher'
     }
     if (to && p.switchWeapon(to, this.time)) {
       this.sfx('swap')
@@ -424,14 +432,15 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
     const input = this.input
     const t = this.time
     p.look(look.x, look.y)
-    p.ads += ((input.held('aim') && !p.sprinting && !(p.weapon === 'rifle' && p.reloading) ? 1 : 0) - p.ads) * Math.min(1, dt * 12)
+    p.ads += ((input.held('aim') && !p.sprinting && !(p.weapon !== 'launcher' && p.reloading) ? 1 : 0) - p.ads) * Math.min(1, dt * 12)
     const ev = p.move(dt, input, this.col, t)
     if (ev === 'jump') this.sfx('jump')
     if (ev === 'splash') this.sfx('splash')
     this.handleWeaponKeys()
     this.updateLock(dt)
     if (input.consume('reload')) {
-      if (p.weapon === 'rifle' ? p.startReload(t) : p.startRocketReload(t)) this.sfx('reload')
+      if (p.startReload(t)) this.sfx('reload')
+      else if (p.weapon === 'rifle' && p.reserve < 1) this.ammoHint(true)
     }
     if (input.held('fire') && !p.sprinting) this.tryPlayerFire()
     if (input.consume('grenade')) this.throwGrenade()
@@ -454,13 +463,21 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
     }
     const t = this.time
     if (p.reloading || t < p.nextFire) return
-    if (p.mag <= 0) {
+    const pistol = p.weapon === 'pistol'
+    if (pistol ? p.pmag <= 0 : p.mag <= 0) {
       if (this.input.consume('fire')) this.sfx('empty')
       if (p.startReload(t)) this.sfx('reload')
+      else if (!pistol && p.rifleDry) {
+        // Rifle is bone dry: fall back to the sidearm and point at the nearest resupply.
+        p.switchWeapon('pistol', t)
+        this.sfx('swap')
+        this.ammoHint(true)
+      }
       return
     }
-    p.nextFire = t + 60 / CONFIG.weapon.rpm
-    p.mag -= 1
+    p.nextFire = t + 60 / (pistol ? CONFIG.pistol.rpm : CONFIG.weapon.rpm)
+    if (pistol) p.pmag -= 1
+    else p.mag -= 1
     p.shots += 1
     const origin = this.camera.getWorldPosition(tmpV).clone()
     const dir = this.aimDir(p.spread(t))
@@ -468,10 +485,13 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
     const muzzle = this.viewModel.muzzle(tmpV2).clone()
     this.muzzleLight.position.copy(muzzle)
     this.muzzleLight.intensity = 3
-    this.fire({ team: p.team, name: p.name, unit: p }, origin, dir, CONFIG.weapon.damage, 0xffe2a0, muzzle, true)
+    this.fire({ team: p.team, name: p.name, unit: p }, origin, dir, pistol ? CONFIG.pistol.damage : CONFIG.weapon.damage, pistol ? 0xfff2c8 : 0xffe2a0, muzzle, true, pistol)
     p.applyRecoil(t)
     this.sfx('shot')
-    if (p.mag === 0 && p.startReload(t)) this.sfx('reload')
+    if ((pistol ? p.pmag : p.mag) === 0) {
+      if (p.startReload(t)) this.sfx('reload')
+      else if (!pistol && p.rifleDry) this.ammoHint(true)
+    } else if (!pistol && p.reserve < CONFIG.lowReserve && p.mag === 10) this.ammoHint(false)
   }
 
   /** Flyfish-2: dumb-fire straight, or guided when a lock is held (right mouse on a vehicle/aircraft/emplacement). */
@@ -925,7 +945,7 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
     this.handleWeaponKeys()
     this.updateLock(dt)
     if (this.input.consume('reload')) {
-      if (p.weapon === 'rifle' ? p.startReload(this.time) : p.startRocketReload(this.time)) this.sfx('reload')
+      if (p.startReload(this.time)) this.sfx('reload')
     }
     if (this.input.held('fire')) this.tryPlayerFire()
     this.prompt = h.phase === 'hover' ? L('即将机降…', 'Inserting…') : L(`乘坐直升机前往 ${h.mission?.name ?? ''} · 按 E 跳伞`, `En route to ${h.mission?.name ?? ''} · press E to jump`)
@@ -1070,8 +1090,8 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
 
   // ─── combat ─────────────────────────────────────────────────────────────
   /** Hitscan shot. `visualFrom` is where the tracer starts (muzzle). */
-  fire(shooter: Shooter, origin: THREE.Vector3, dir: THREE.Vector3, damage: number, tracer: number, visualFrom?: THREE.Vector3, byPlayer = false): void {
-    const range = CONFIG.weapon.range
+  fire(shooter: Shooter, origin: THREE.Vector3, dir: THREE.Vector3, damage: number, tracer: number, visualFrom?: THREE.Vector3, byPlayer = false, pistol = false): void {
+    const range = pistol ? CONFIG.pistol.range : CONFIG.weapon.range
     const wall = this.col.raycast(origin, dir, range)
     let bestT = wall ? wall.t : range
     let hitUnit: Unit | null = null
@@ -1098,7 +1118,7 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
     if (!byPlayer && shooter.unit) this.sfx('enemyShot', from)
     if (hitUnit) {
       this.fx.blood(end)
-      this.damageUnit(hitUnit, damage * (head ? CONFIG.weapon.headMult : 1), shooter, head, origin)
+      this.damageUnit(hitUnit, damage * (head ? (pistol ? CONFIG.pistol.headMult : CONFIG.weapon.headMult) : 1), shooter, head, origin, pistol ? pistolName() : weaponName())
     } else if (hitThing) {
       this.fx.burst(end, 5, 0xfff0b0, 5, 0.05, 0.25)
       this.damageThing(hitThing, damage * 0.75, shooter)
@@ -1768,7 +1788,8 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
       }
       if (s.kind === 'supply') {
         p.reserve = CONFIG.weapon.maxReserve
-        p.mag = p.reloading && p.weapon === 'rifle' ? p.mag : CONFIG.weapon.mag
+        if (!(p.reloading && p.weapon === 'rifle')) p.mag = CONFIG.weapon.mag
+        p.pmag = CONFIG.pistol.mag
         p.grenades = Math.min(CONFIG.grenade.max, p.grenades + 2)
         p.rocketReserve = Math.min(CONFIG.launcher.maxReserve, p.rocketReserve + 2)
         if (p.rocket === 0) p.startRocketReload(t)
@@ -1789,9 +1810,82 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
     const base = BASES[PLAYER_TEAM]
     if (p.alive && p.mode === 'foot' && Math.hypot(p.pos.x - base.x, p.pos.z - base.z) < base.r) {
       p.hp = Math.min(p.maxHp, p.hp + CONFIG.stations.baseHealRate * dt)
-      if (p.reserve < CONFIG.weapon.reserve) p.reserve = Math.min(CONFIG.weapon.reserve, p.reserve + 30 * dt)
+      this.topUp(dt, 30, CONFIG.weapon.reserve)
     }
-    p.reserve = Math.floor(p.reserve * 100) / 100
+    // Offshore Isle depot (sea mode, own team holds the isle): fast ammo + missile top-up.
+    if (p.alive && p.mode === 'foot' && this.islandDepotActive() && Math.hypot(p.pos.x - ISLAND_DEPOT.x, p.pos.z - ISLAND_DEPOT.z) < ISLAND_DEPOT.r) {
+      const before = p.reserve
+      this.topUp(dt, 60, CONFIG.weapon.maxReserve)
+      if (p.mag < CONFIG.weapon.mag) {
+        if (p.weapon === 'rifle') {
+          if (!p.reloading) p.startReload(this.time)
+        } else {
+          const take = Math.min(CONFIG.weapon.mag - p.mag, p.reserve)
+          p.mag += take
+          p.reserve -= take
+        }
+      }
+      p.pmag = CONFIG.pistol.mag
+      this.depotMissileAcc += dt
+      if (this.depotMissileAcc > 4 && p.rocketReserve < CONFIG.launcher.maxReserve) {
+        this.depotMissileAcc = 0
+        p.rocketReserve += 1
+        if (p.rocket === 0) p.startRocketReload(this.time)
+      }
+      this.prompt = L(`出海岛弹药库：补充中 ${Math.floor(p.reserve)}/${CONFIG.weapon.maxReserve}`, `Isle ammo depot: resupplying ${Math.floor(p.reserve)}/${CONFIG.weapon.maxReserve}`)
+      if (before < 1 && p.reserve >= 1) this.sfx('supply')
+    }
+    p.reserve = Math.floor(p.reserve)
+  }
+
+  /** Add whole rounds to the rifle reserve at `rate` per second, up to `cap` (keeps ammo integral). */
+  private topUp(dt: number, rate: number, cap: number): void {
+    const p = this.player
+    if (p.reserve >= cap) {
+      this.ammoAcc = 0
+      return
+    }
+    this.ammoAcc += rate * dt
+    const add = Math.floor(this.ammoAcc)
+    if (add > 0) {
+      this.ammoAcc -= add
+      p.reserve = Math.min(cap, p.reserve + add)
+    }
+  }
+  islandDepotActive(): boolean {
+    return RT.sea && this.islandOwner() === this.player.team
+  }
+  /** Places the player can refill rifle ammo, nearest first. */
+  ammoPoints(): { x: number; z: number; name: string; ready: boolean; d: number }[] {
+    const p = this.player
+    const out: { x: number; z: number; name: string; ready: boolean; d: number }[] = []
+    STATIONS.forEach((s, i) => {
+      if (s.kind !== 'supply') return
+      out.push({ x: s.x, z: s.z, name: stationName(s), ready: this.time >= this.stationReady[i], d: 0 })
+    })
+    const base = BASES[PLAYER_TEAM]
+    out.push({ x: base.x, z: base.z, name: L('红方部署区', 'Red staging area'), ready: true, d: 0 })
+    if (this.islandDepotActive()) out.push({ x: ISLAND_DEPOT.x, z: ISLAND_DEPOT.z, name: L('出海岛弹药库', 'Isle ammo depot'), ready: true, d: 0 })
+    for (const o of out) o.d = Math.hypot(o.x - p.pos.x, o.z - p.pos.z)
+    // Prefer a ready point unless a cooling-down one is much closer.
+    return out.sort((a, b) => (a.ready === b.ready ? a.d - b.d : a.ready ? (a.d < b.d + 60 ? -1 : 1) : b.d < a.d + 60 ? 1 : -1))
+  }
+  /** Rifle ammo state for the HUD: '' | 'low' | 'dry'. */
+  get ammoState(): '' | 'low' | 'dry' {
+    const p = this.player
+    if (p.rifleDry) return 'dry'
+    if (p.reserve < CONFIG.lowReserve) return 'low'
+    return ''
+  }
+  private ammoHintAt = -99
+  /** Tell the player where to resupply (rate-limited). */
+  private ammoHint(dry: boolean): void {
+    if (this.time < this.ammoHintAt) return
+    this.ammoHintAt = this.time + 6
+    const best = this.ammoPoints()[0]
+    const where = best ? L(`最近补给：${best.name}（${Math.round(best.d)} 米）`, `nearest resupply: ${best.name} (${Math.round(best.d)} m)`) : ''
+    if (dry) this.toast(L(`步枪弹药耗尽！已切换 P-7 手枪（无限备弹，需换弹）· ${where}`, `Rifle out of ammo! Switched to the P-7 sidearm (unlimited spares, still reloads) · ${where}`), 'bad')
+    else this.toast(L(`步枪备弹不足 · ${where}`, `Rifle ammo low · ${where}`), 'info')
   }
 
   private stepEnemyHeli(): void {

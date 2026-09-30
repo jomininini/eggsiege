@@ -45,6 +45,8 @@ export const POINTS: PointDef[] = [
   { id: 'isle', name: '出海岛', en: 'Offshore Isle', short: '岛', shortEn: 'ISL', kind: 'island', x: 0, z: -127, r: 9, standX: 0, standZ: -127 },
 ]
 export const ISLAND_POINT = POINTS.length - 1
+/** Ammo depot on the Offshore Isle (sea mode): active for whichever team holds the isle. */
+export const ISLAND_DEPOT = { x: 6, z: -118.5, r: 3.6 }
 export const pointName = (p: PointDef): string => L(p.name, p.en)
 export const pointShort = (p: PointDef): string => L(p.short, p.shortEn)
 /** Number of active points for the chosen mode. */

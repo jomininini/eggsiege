@@ -57,6 +57,21 @@ export const CONFIG = {
     recoilYaw: 0.004,
     recoilRecover: 7,
   },
+  /** P-7 sidearm: unlimited spare ammo, but the 12-round magazine still has to be reloaded. */
+  pistol: {
+    mag: 12,
+    rpm: 330,
+    damage: 19,
+    headMult: 2.2,
+    reload: 1.35,
+    range: 120,
+    spread: 0.006,
+    recoilPitch: 0.02,
+    recoilYaw: 0.006,
+    bloomPerShot: 0.009,
+  },
+  /** Rifle reserve below this counts as low ammo (HUD warning + resupply hint). */
+  lowReserve: 30,
   /** Shoulder-fired guided missile: hits infantry, vehicles, boats, aircraft and emplacements. */
   launcher: {
     reserve: 3,
@@ -175,6 +190,7 @@ export const teamName = (t: number): string => (t === 0 ? L('红方 · 赤焰', 
 export const teamShort = (t: number): string => (t === 0 ? L('红方', 'Red') : L('蓝方', 'Blue'))
 export const weaponName = (): string => L('KT-9 脉冲步枪', 'KT-9 Pulse Rifle')
 export const launcherName = (): string => L('飞鱼-2 便携导弹', 'Flyfish-2 Missile')
+export const pistolName = (): string => L('P-7 手枪', 'P-7 Sidearm')
 export const TEAM_COLORS = [0xff4d5e, 0x3fa9ff] as const
 export const TEAM_CSS = ['#ff4d5e', '#3fa9ff'] as const
 export const NEUTRAL_COLOR = 0xffd35c

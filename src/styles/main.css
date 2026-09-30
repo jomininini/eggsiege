@@ -566,3 +566,22 @@ input[type=checkbox] { accent-color: var(--teal); width: 16px; height: 16px; }
 }
 .brief .btns { flex-wrap: nowrap; }
 .brief .btns .btn { white-space: nowrap; padding-left: 16px; padding-right: 16px; }
+
+/* ─── Briefing minimise ─── */
+.panel-h .min { margin-left: 8px; min-width: 30px; height: 26px; padding: 0 8px; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.18); color: #dfe9ef; border-radius: 4px; cursor: pointer; font: inherit; font-size: 0.8em; }
+.panel-h .min:hover { border-color: var(--gold); color: #fff; }
+.panel-h .min .mx { display: none; }
+.brief.mini .panel-h .min .mi { display: none; }
+.brief.mini .panel-h .min .mx { display: inline; }
+.brief.mini .brief-body, .brief.mini .brief-body2 { display: none; }
+.brief.mini { padding-bottom: 14px; }
+.brief.mini .btns { margin-top: 10px; }
+
+/* ─── Sidearm + ammo warning ─── */
+.slots.w3 .s3 { opacity: 1; color: #fff; }
+.ammo.pistol { border-color: #cfd8dc; }
+.ammo-row .res.low { color: var(--red); animation: pulse 0.8s infinite; }
+.ammo-warn { display: none; align-items: center; justify-content: flex-end; gap: 8px; margin: -2px 0 6px; font-size: 0.78em; font-weight: 700; color: #ffcf8a; }
+.ammo-warn.low, .ammo-warn.dry { display: flex; }
+.ammo-warn.dry { color: #ff8a8a; animation: pulse 0.9s infinite; }
+.ammo-warn .arr { display: inline-block; font-style: normal; color: #ffa94d; transition: transform 0.12s linear; }

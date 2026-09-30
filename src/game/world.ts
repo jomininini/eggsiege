@@ -5,7 +5,7 @@ import { Collision } from './collide'
 import { TEAM_CSS, TEAM_COLORS } from './config'
 import { L } from './i18n'
 import {
-  BASES, BOAT_SPAWNS, BRIDGES, BUILDINGS, CANAL, DRONE_PADS, EGG, HELIPADS, ISLAND, ISLAND_JETTIES, LAKE, LAND, PIERS, POINTS, ROADS,
+  BASES, BOAT_SPAWNS, BRIDGES, BUILDINGS, CANAL, DRONE_PADS, EGG, HELIPADS, ISLAND, ISLAND_DEPOT, ISLAND_JETTIES, LAKE, LAND, PIERS, POINTS, ROADS,
   SHORE_Z, SKILLS, STATIONS, WATER_Y, isInlandWater, pointShort, type BuildingDef, type StationDef,
 } from './map'
 import { badgeTexture, eggTexture, facadeTextures, groundTexture, helipadTexture, signMesh, skyTexture, textTexture } from './textures'
@@ -514,6 +514,17 @@ export class World {
     const title = this.label('出海岛 · 海上前哨', 'Offshore Isle · sea outpost', 1.8, { color: '#fff4c2', bg: 'rgba(40,30,5,0.78)', size: 56, pad: 14 })
     title.position.set(I.x, I.y + 7.5, I.z - 2)
     this.scene.add(title)
+    // Ammo depot pad next to the crates (usable by whoever holds the isle).
+    const D = ISLAND_DEPOT
+    const pad = new THREE.Mesh(new THREE.RingGeometry(D.r - 0.35, D.r, 40), new THREE.MeshBasicMaterial({ color: 0xffa94d, transparent: true, opacity: 0.85, toneMapped: false, depthWrite: false }))
+    pad.rotation.x = -Math.PI / 2
+    pad.position.set(D.x, I.y + 0.06, D.z)
+    pad.userData.keep = true
+    this.scene.add(pad)
+    this.box(D.x - 1.6, I.y, D.z - 1.2, 1.2, 0.9, 0.8, this.mats.crate)
+    const depotSign = this.label('弹药补给库 · 占岛后可用', 'Ammo depot · for the isle holder', 0.75, { color: '#ffe0b0', bg: 'rgba(60,30,5,0.85)', size: 40, pad: 10 })
+    depotSign.position.set(D.x, I.y + 2.6, D.z)
+    this.scene.add(depotSign)
     const jettySign = this.label('巡逻艇码头 · 可经水道直达金蛋湖', 'Patrol jetty · canal to the Egg Lake', 0.8, { color: '#fff', bg: 'rgba(120,90,10,0.85)', size: 40, pad: 10 })
     jettySign.position.set(I.x, I.y + 3, I.z + 15)
     this.scene.add(jettySign)
