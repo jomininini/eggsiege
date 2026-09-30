@@ -1,570 +1,646 @@
 import type { Audio } from '../engine/audio'
-import type { I18n } from '../engine/i18n'
-import type { Input } from '../engine/input'
-import { insertScore, type Locale, type Quality, type SaveData, type SaveStore } from '../engine/save'
-import { CONFIG } from '../game/config'
-import type { Compass, Hint } from '../game/game'
-import { formatClock, stars, type RunState } from '../game/rules'
+import type { SaveData, SaveStore } from '../engine/save'
+import { CONFIG, PLAYER_TEAM, TEAM_CSS, TEAM_NAMES, TEAM_SHORT } from '../game/config'
+import type { FeedEntry, Game, MatchResult, Marker, Toast } from '../game/game'
+import { BASES, BUILDINGS, DRONE_PADS, HELIPADS, LAND, POINTS, ROADS, SEA, SHORE_Z, SKILLS, STATIONS, type SkillId } from '../game/map'
+import { eggIndex, formatClock } from '../game/rules'
 
-export type Screen = 'boot' | 'title' | 'hud' | 'pause' | 'settings' | 'leaderboard' | 'results'
-
+export type Screen = 'boot' | 'title' | 'hud' | 'pause' | 'end'
 export type UiActions = {
   play(): void
-  resume(): void
   restart(): void
+  resume(): void
   quit(): void
   settings(patch: Partial<SaveData>): void
 }
 
-const ICON = {
-  core: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 1 21 12 12 23 3 12Z" fill="currentColor"/><path d="M12 1 21 12H3Z" fill="#fff" opacity=".35"/></svg>',
-  cell: '<svg viewBox="0 0 20 30" aria-hidden="true"><rect x="6" y="0" width="8" height="4" rx="1.5" fill="currentColor"/><rect x="1.5" y="4" width="17" height="25" rx="4" fill="none" stroke="currentColor" stroke-width="3"/><rect class="fill" x="5" y="8" width="10" height="17" rx="2" fill="currentColor"/></svg>',
-  star: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 2 3 6.6 7.2.8-5.4 4.9 1.5 7.1L12 17.8 5.7 21.4l1.5-7.1L1.8 9.4 9 8.6Z" fill="currentColor"/></svg>',
-  arrow: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 20 20 12 15 4 20Z" fill="currentColor"/></svg>',
-  pause: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="4" width="5" height="16" rx="1.5" fill="currentColor"/><rect x="14" y="4" width="5" height="16" rx="1.5" fill="currentColor"/></svg>',
+const REASONS: Record<string, string> = {
+  egg: '守住金蛋直至倒计时结束',
+  score: '率先达到目标积分',
+  time: '作战时间结束，积分领先',
+  '': '',
 }
 
-/** Glyphs for control hints, per input method. */
-const GLYPH = {
-  keyboard: { keys: '<kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd>', jump: '<kbd class="wide">Space</kbd>', dash: '<kbd>F</kbd>', select: '<kbd>Enter</kbd>', back: '<kbd>Esc</kbd>' },
-  gamepad: { keys: '<kbd class="round">L</kbd>', stickR: '<kbd class="round">R</kbd>', jump: '<kbd class="round a">A</kbd>', dash: '<kbd class="round x">X</kbd>', select: '<kbd class="round a">A</kbd>', back: '<kbd class="round b">B</kbd>' },
+const CONTROLS: [string, string][] = [
+  ['W A S D', '移动 / 驾驶'],
+  ['鼠标', '瞄准视角'],
+  ['左键', '射击'],
+  ['右键', '机瞄（ADS）'],
+  ['R', '换弹'],
+  ['Shift', '冲刺 / 无人机加速'],
+  ['空格', '跳跃'],
+  ['C / Ctrl', '蹲伏（更稳）'],
+  ['G', '投掷手雷'],
+  ['E / F', '交互：上下载具、起飞无人机、登直升机'],
+  ['1 - 5', '选择直升机目标据点'],
+  ['Tab', '战况计分板'],
+  ['Esc / P', '暂停'],
+]
+
+const LEGEND: [string, string, string][] = [
+  ['#ffd35c', '金蛋 · 主控点', `中央高锟会议中心。占领每秒 +${CONFIG.match.tick.egg} 分，守满 ${CONFIG.match.eggHoldToWin} 秒直接获胜。`],
+  ['#e8edf2', 'A B C D 建筑据点', '机器人中心、InnoCell、5E、大展览厅，每秒 +1 分。'],
+  ['#ffa94d', '餐厅 · 补给点', '海滨餐厅、海港茶餐厅、美食广场：补满弹药，手雷 +2。'],
+  ['#9d8cff', '科技公司 · 技能点', '量子扫描、纳米护盾、智能稳定、神经加速，持续 22 秒。'],
+  ['#5cff9d', '会所 · 回血点', '站在会所泳池平台上持续恢复生命。'],
+  ['#7ef9ff', '屋顶无人机坪', '10W、20E 屋顶（外挂楼梯上去），俯视侦察并标记敌人。'],
+  ['#ff4d5e', '直升机 / 战车 / 快艇', '基地停机坪机降突击；道路战车、码头快艇可从海上登陆。'],
+]
+
+function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls = '', html = ''): HTMLElementTagNameMap[K] {
+  const e = document.createElement(tag)
+  if (cls) e.className = cls
+  if (html) e.innerHTML = html
+  return e
 }
 
-/**
- * DOM game UI: title, HUD, pause, settings, results and leaderboard as HTML/CSS layered over the
- * canvas. Every screen is keyboard-, gamepad- and touch-navigable; text comes from i18n keys and
- * re-renders on language change.
- */
 export class Ui {
-  screen: Screen = 'boot'
-  private readonly root: HTMLElement
-  private readonly stack: Screen[] = []
-  private hudCache = new Map<string, string>()
-  private hintKey: Hint | null = null
-  private navRepeat = 0
-  private lastRun?: RunState
-  private savedRank = -1
-  private stormShown = false
-  private lastMethod = ''
+  private root = document.querySelector<HTMLDivElement>('#ui')!
+  private screens = new Map<Screen, HTMLElement>()
+  private current: Screen = 'boot'
+  private game?: Game
+  private hud!: Record<string, HTMLElement>
+  private mini!: HTMLCanvasElement
+  private miniBg?: HTMLCanvasElement
+  private markerPool: HTMLDivElement[] = []
+  private cache = new Map<string, string>()
+  private hitTimer = 0
+  private hurtEls: HTMLDivElement[] = []
+  private miniTick = 0
 
-  constructor(
-    private readonly i18n: I18n,
-    private readonly save: SaveStore,
-    private readonly audio: Audio,
-    private readonly input: Input,
-    private readonly actions: UiActions,
-  ) {
-    this.root = document.getElementById('ui')!
-    this.root.innerHTML = this.template()
-    this.root.addEventListener('click', e => this.onClick(e))
-    this.root.addEventListener('input', e => this.onInput(e))
-    this.root.addEventListener('focusin', e => {
-      if ((e.target as HTMLElement).matches('.btn, .seg button, .toggle')) this.audio.play('ui')
+  constructor(private readonly save: SaveStore, private readonly audio: Audio, private readonly actions: UiActions) {
+    this.root.lang = 'zh-CN'
+    document.documentElement.lang = 'zh-CN'
+    this.buildBoot()
+    this.buildTitle()
+    this.buildHud()
+    this.buildPause()
+    this.buildEnd()
+  }
+
+  attach(game: Game): void {
+    this.game = game
+    game.on({
+      feed: e => this.pushFeed(e),
+      toast: t => this.pushToast(t),
+      hurt: a => this.showHurt(a),
+      hitmarker: (kill, head) => this.showHit(kill, head),
+      end: r => {
+        this.showEnd(r)
+        this.show('end')
+        if (document.pointerLockElement) document.exitPointerLock()
+      },
+      stateChange: () => undefined,
     })
-    window.addEventListener('keydown', e => this.onKey(e))
-    i18n.onChange(() => this.translate())
-    this.translate()
-    this.refreshSettings()
+  }
+
+  show(s: Screen): void {
+    this.current = s
+    for (const [k, e] of this.screens) e.classList.toggle('on', k === s || (k === 'hud' && (s === 'pause' || s === 'end')))
+    this.screens.get('hud')!.classList.toggle('dim', s === 'pause' || s === 'end')
+  }
+  get screen(): Screen {
+    return this.current
+  }
+
+  setBootProgress(v: number): void {
+    const bar = this.screens.get('boot')?.querySelector<HTMLElement>('.bar i')
+    if (bar) bar.style.width = `${Math.round(v * 100)}%`
   }
 
   // ─── screens ────────────────────────────────────────────────────────────
-
-  show(screen: Screen): void {
-    this.stack.length = 0
-    this.setScreen(screen)
+  private screen_(name: Screen, cls: string): HTMLElement {
+    const s = el('section', `screen ${cls}`)
+    this.screens.set(name, s)
+    this.root.appendChild(s)
+    return s
   }
 
-  /** Open an overlay screen (settings, leaderboard) that returns to the current one on Back. */
-  push(screen: Screen): void {
-    this.stack.push(this.screen)
-    this.setScreen(screen)
+  private buildBoot(): void {
+    const s = this.screen_('boot', 'boot')
+    s.innerHTML = `<div class="boot-card"><div class="logo-egg"></div><h1>金蛋争夺战</h1><p>正在部署科学园战区…</p><div class="bar"><i></i></div></div>`
   }
 
-  back(): void {
-    const prev = this.stack.pop()
-    if (prev) this.setScreen(prev)
-    else if (this.screen === 'pause') this.actions.resume()
+  private buildTitle(): void {
+    const s = this.screen_('title', 'title')
+    s.innerHTML = `
+      <div class="title-wrap">
+        <div class="brand">
+          <div class="kicker">临海创科园区 · 战术据点争夺</div>
+          <h1><span class="gold">金蛋</span>争夺战</h1>
+          <div class="sub">科学园前线</div>
+        </div>
+        <div class="brief panel">
+          <div class="panel-h">任务简报</div>
+          <p>吐露港畔的创科园区被划为演习战区。<b class="r">红方 · 赤焰</b> 与 <b class="b">蓝方 · 海鹰</b> 各 6 人，围绕五个据点展开争夺——核心是园区中央、十根白柱托起的<b class="g">金蛋</b>。</p>
+          <ul class="goals">
+            <li><i>01</i>占领据点每秒累积积分，先到 <b>${CONFIG.match.targetScore}</b> 分获胜</li>
+            <li><i>02</i>或者占领<b class="g">金蛋</b>并连续守住 <b>${CONFIG.match.eggHoldToWin}</b> 秒，直接取胜</li>
+            <li><i>03</i>利用餐厅补给、科技公司技能、会所回血、屋顶无人机、直升机机降与海上登陆打开局面</li>
+          </ul>
+          <div class="btns">
+            <button class="btn primary" data-a="play">开始作战</button>
+            <button class="btn" data-a="howto">操作与地图说明</button>
+            <button class="btn" data-a="settings">设置</button>
+          </div>
+          <div class="career"></div>
+          <div class="hint">点击“开始作战”后鼠标将被锁定用于瞄准，按 Esc 可随时暂停。</div>
+        </div>
+      </div>
+      <div class="modal howto">
+        <div class="panel wide">
+          <div class="panel-h">操作说明 <button class="x" data-a="close">×</button></div>
+          <div class="cols">
+            <div><h3>基础操作</h3><div class="keys">${CONTROLS.map(([k, v]) => `<div><kbd>${k}</kbd><span>${v}</span></div>`).join('')}</div></div>
+            <div><h3>园区战术要素</h3><div class="legend">${LEGEND.map(([c, t, d]) => `<div><i style="--c:${c}"></i><b>${t}</b><span>${d}</span></div>`).join('')}</div></div>
+          </div>
+          <div class="tips">小技巧：据点内人数越多占领越快；敌我同时在场时进度冻结。敌方据点需先“中立化”再占领。蓝方直升机会定期飞来压制，用步枪、车载机枪集火可将其击落。</div>
+        </div>
+      </div>
+      <div class="modal settings-m"><div class="panel">${this.settingsHtml()}<div class="btns"><button class="btn primary" data-a="close">完成</button></div></div></div>`
+    s.querySelector('[data-a=play]')!.addEventListener('click', () => {
+      this.click()
+      this.actions.play()
+    })
+    s.querySelector('[data-a=howto]')!.addEventListener('click', () => {
+      this.click()
+      s.querySelector('.howto')!.classList.add('on')
+    })
+    s.querySelector('[data-a=settings]')!.addEventListener('click', () => {
+      this.click()
+      s.querySelector('.settings-m')!.classList.add('on')
+    })
+    s.querySelectorAll('[data-a=close]').forEach(b => b.addEventListener('click', () => {
+      this.click()
+      s.querySelectorAll('.modal').forEach(m => m.classList.remove('on'))
+    }))
+    this.bindSettings(s)
+    this.updateCareer()
   }
 
-  private setScreen(screen: Screen): void {
-    this.screen = screen
-    for (const el of this.root.querySelectorAll<HTMLElement>('[data-screen]')) {
-      const active = el.dataset.screen === screen || (el.dataset.screen === 'hud' && (screen === 'pause' || screen === 'results' || (screen === 'settings' && this.stack.includes('pause'))))
-      el.classList.toggle('is-active', active)
-      el.setAttribute('aria-hidden', String(!active))
-    }
-    this.root.dataset.activeScreen = screen
-    if (screen === 'title') this.renderBest()
-    if (screen === 'leaderboard') this.renderLeaderboard()
-    if (screen === 'hud') this.stormShown = false
-    // Focus the first control so keyboard and gamepad players can act immediately.
-    requestAnimationFrame(() => {
-      const first = this.navItems()[0]
-      if (first && this.input.method !== 'touch') first.focus({ preventScroll: true })
-      else (document.activeElement as HTMLElement | null)?.blur?.()
+  private updateCareer(): void {
+    const d = this.save.data
+    const c = this.screens.get('title')?.querySelector('.career')
+    if (c) c.innerHTML = d.matches ? `战绩：${d.matches} 场 · 胜 ${d.wins} · 单局最多击倒 ${d.bestKills}` : ''
+  }
+
+  private settingsHtml(): string {
+    const d = this.save.data
+    return `<div class="panel-h">设置</div>
+      <div class="settings">
+        <label>鼠标灵敏度 <input type="range" min="0.2" max="3" step="0.05" data-s="sensitivity" value="${d.sensitivity}"><em></em></label>
+        <label>音乐音量 <input type="range" min="0" max="1" step="0.05" data-s="musicVolume" value="${d.musicVolume}"><em></em></label>
+        <label>音效音量 <input type="range" min="0" max="1" step="0.05" data-s="sfxVolume" value="${d.sfxVolume}"><em></em></label>
+        <label>画质 <select data-s="quality"><option value="low">流畅</option><option value="medium">均衡</option><option value="high">高清（泛光）</option></select></label>
+        <label class="chk"><input type="checkbox" data-s="invertY" ${d.invertY ? 'checked' : ''}> 反转 Y 轴</label>
+        <label class="chk"><input type="checkbox" data-s="muted" ${d.muted ? 'checked' : ''}> 静音</label>
+      </div>`
+  }
+
+  private bindSettings(scope: HTMLElement): void {
+    scope.querySelectorAll<HTMLInputElement | HTMLSelectElement>('[data-s]').forEach(inp => {
+      const key = inp.dataset.s as keyof SaveData
+      if (inp instanceof HTMLSelectElement) inp.value = String(this.save.data[key])
+      const out = inp.parentElement?.querySelector('em')
+      const show = () => {
+        if (out && inp instanceof HTMLInputElement && inp.type === 'range') out.textContent = key === 'sensitivity' ? Number(inp.value).toFixed(2) : `${Math.round(Number(inp.value) * 100)}%`
+      }
+      show()
+      inp.addEventListener('input', () => {
+        show()
+        let v: unknown
+        if (inp instanceof HTMLInputElement && inp.type === 'checkbox') v = inp.checked
+        else if (inp instanceof HTMLInputElement) v = Number(inp.value)
+        else v = inp.value
+        this.actions.settings({ [key]: v } as Partial<SaveData>)
+        // Keep other copies of the same control in sync.
+        this.root.querySelectorAll<HTMLInputElement | HTMLSelectElement>(`[data-s=${key}]`).forEach(o => {
+          if (o === inp) return
+          if (o instanceof HTMLInputElement && o.type === 'checkbox') o.checked = v as boolean
+          else o.value = String(v)
+        })
+      })
     })
   }
 
-  setBootProgress(progress: number): void {
-    const bar = this.q<HTMLElement>('.boot-bar i')
-    bar.style.transform = `scaleX(${Math.max(0.04, Math.min(1, progress))})`
+  private buildPause(): void {
+    const s = this.screen_('pause', 'pause')
+    s.innerHTML = `<div class="panel">
+      <div class="panel-h">作战暂停</div>
+      <div class="btns col">
+        <button class="btn primary" data-a="resume">继续作战</button>
+        <button class="btn" data-a="restart">重新开始</button>
+        <button class="btn" data-a="quit">返回标题</button>
+      </div>
+      ${this.settingsHtml()}
+      <div class="mini-keys">${CONTROLS.slice(0, 11).map(([k, v]) => `<span><kbd>${k}</kbd>${v}</span>`).join('')}</div>
+    </div>`
+    s.querySelector('[data-a=resume]')!.addEventListener('click', () => this.actions.resume())
+    s.querySelector('[data-a=restart]')!.addEventListener('click', () => this.actions.restart())
+    s.querySelector('[data-a=quit]')!.addEventListener('click', () => this.actions.quit())
+    this.bindSettings(s)
+  }
+
+  private buildEnd(): void {
+    const s = this.screen_('end', 'end')
+    s.innerHTML = `<div class="panel end-panel"><div class="end-banner"></div><div class="end-reason"></div><div class="end-score"></div><div class="end-stats"></div><div class="end-board"></div>
+      <div class="btns"><button class="btn primary" data-a="restart">再战一局</button><button class="btn" data-a="quit">返回标题</button></div></div>`
+    s.querySelector('[data-a=restart]')!.addEventListener('click', () => this.actions.restart())
+    s.querySelector('[data-a=quit]')!.addEventListener('click', () => this.actions.quit())
+  }
+
+  private showEnd(r: MatchResult): void {
+    const s = this.screens.get('end')!
+    const win = r.winner === PLAYER_TEAM
+    const draw = r.winner < 0
+    const banner = s.querySelector<HTMLElement>('.end-banner')!
+    banner.className = `end-banner ${draw ? 'draw' : win ? 'win' : 'lose'}`
+    banner.innerHTML = draw ? '平 局' : win ? '胜 利' : '失 败'
+    s.querySelector('.end-reason')!.innerHTML = draw ? '双方积分相同' : `${TEAM_NAMES[r.winner]} ${REASONS[r.reason]}`
+    s.querySelector('.end-score')!.innerHTML = `<b style="color:${TEAM_CSS[0]}">${Math.floor(r.scores[0])}</b><span>积分</span><b style="color:${TEAM_CSS[1]}">${Math.floor(r.scores[1])}</b><em>作战时长 ${formatClock(r.time)}</em>`
+    const p = r.player
+    s.querySelector('.end-stats')!.innerHTML = [
+      ['击倒', p.kills], ['阵亡', p.deaths], ['占领', p.captures], ['命中率', `${Math.round(p.accuracy * 100)}%`], ['爆头', p.headshots], ['伤害', p.damage],
+    ].map(([k, v]) => `<div><b>${v}</b><span>${k}</span></div>`).join('')
+    s.querySelector('.end-board')!.innerHTML = this.boardHtml(r.board)
+    const d = this.save.data
+    this.save.update({ matches: d.matches + 1, wins: d.wins + (win ? 1 : 0), bestKills: Math.max(d.bestKills, p.kills) })
+    this.updateCareer()
+  }
+
+  private boardHtml(board: MatchResult['board']): string {
+    const cols = [0, 1].map(team => `<div class="team t${team}"><div class="th">${TEAM_NAMES[team]}</div><div class="row h"><span>队员</span><span>击倒</span><span>阵亡</span><span>占领</span></div>${board
+      .filter(b => b.team === team)
+      .map(b => `<div class="row ${b.isPlayer ? 'me' : ''}"><span>${b.name}</span><span>${b.kills}</span><span>${b.deaths}</span><span>${b.captures}</span></div>`)
+      .join('')}</div>`)
+    return cols.join('')
   }
 
   // ─── HUD ────────────────────────────────────────────────────────────────
-
-  updateHud(run: RunState, compass: Compass | null): void {
-    this.set('cores', `${run.collected}<small>/${run.total}</small>`)
-    this.set('score', run.score.toLocaleString(this.i18n.locale))
-    this.set('clock', formatClock(run.timeLeft))
-    const low = run.timeLeft <= CONFIG.drones.rageAt
-    this.q('.hud-clock').classList.toggle('is-low', low)
-    if (low && !this.stormShown && run.phase === 'playing') {
-      this.stormShown = true
-      this.banner(this.i18n.t('hud.storm'))
+  private buildHud(): void {
+    const s = this.screen_('hud', 'hud')
+    s.innerHTML = `
+      <div class="vignette"></div><div class="lowhp"></div><div class="drone-fx"><i></i></div>
+      <div class="markers"></div>
+      <div class="top">
+        <div class="scorebar">
+          <div class="team t0"><span class="nm">${TEAM_SHORT[0]}</span><b class="sc0">0</b><div class="goal"><i class="g0"></i></div></div>
+          <div class="clock"><b class="time">10:00</b><span class="target">目标 ${CONFIG.match.targetScore}</span></div>
+          <div class="team t1"><div class="goal"><i class="g1"></i></div><b class="sc1">0</b><span class="nm">${TEAM_SHORT[1]}</span></div>
+        </div>
+        <div class="chips">${POINTS.map((p, i) => `<div class="chip ${p.kind}" data-i="${i}" title="${p.name}"><b>${p.short}</b><i></i></div>`).join('')}</div>
+        <div class="eggbar"><span class="lbl"></span><div class="track"><i></i></div></div>
+        <div class="toasts"></div>
+      </div>
+      <div class="minimap panel-lite"><canvas width="240" height="184"></canvas><div class="mm-l">科学园战区</div></div>
+      <div class="feed"></div>
+      <div class="center">
+        <div class="cross"><i class="u"></i><i class="d"></i><i class="l"></i><i class="r"></i><i class="dot"></i></div>
+        <div class="hit"><i></i><i></i><i></i><i></i></div>
+        <div class="hurts"></div>
+      </div>
+      <div class="capture"><div class="cap-name"></div><div class="cap-track"><i></i></div><div class="cap-state"></div></div>
+      <div class="prompt"></div>
+      <div class="respawn"><b>你已阵亡</b><span></span></div>
+      <div class="vitals">
+        <div class="hp-row"><span class="ic">+</span><b class="hp">100</b><div class="hpbar"><i class="hpfill"></i><i class="shfill"></i></div></div>
+        <div class="buffs"></div>
+      </div>
+      <div class="ammo">
+        <div class="wname">${CONFIG.weapon.name}</div>
+        <div class="ammo-row"><b class="mag">30</b><span class="res">/ 150</span></div>
+        <div class="gren"><span>手雷</span><b class="gn">2</b><span class="reload">换弹中…</span></div>
+      </div>
+      <div class="scoreboard"></div>`
+    const q = <T extends HTMLElement>(sel: string) => s.querySelector<T>(sel)!
+    this.hud = {
+      sc0: q('.sc0'), sc1: q('.sc1'), g0: q('.g0'), g1: q('.g1'), time: q('.time'), eggbar: q('.eggbar'), eggLbl: q('.eggbar .lbl'), eggFill: q('.eggbar .track i'),
+      toasts: q('.toasts'), feed: q('.feed'), cross: q('.cross'), hit: q('.hit'), hurts: q('.hurts'), capture: q('.capture'), capName: q('.cap-name'),
+      capFill: q('.cap-track i'), capState: q('.cap-state'), prompt: q('.prompt'), respawn: q('.respawn'), respawnT: q('.respawn span'), hp: q('.hp'),
+      hpfill: q('.hpfill'), shfill: q('.shfill'), buffs: q('.buffs'), mag: q('.mag'), res: q('.res'), gn: q('.gn'), reload: q('.reload'), wname: q('.wname'),
+      markers: q('.markers'), lowhp: q('.lowhp'), drone: q('.drone-fx'), board: q('.scoreboard'), chips: q('.chips'), ammo: q('.ammo'),
     }
-    for (const [i, cell] of this.qa('.hud-cell').entries()) cell.classList.toggle('is-empty', i >= run.lives)
-
-    const combo = this.q('.hud-combo')
-    combo.classList.toggle('is-active', run.combo > 1)
-    if (run.combo > 1) {
-      if (this.set('combo', `×${run.combo}`)) {
-        combo.classList.remove('pop')
-        void combo.offsetWidth
-        combo.classList.add('pop')
-      }
-      this.q<HTMLElement>('.hud-combo-bar i').style.transform = `scaleX(${run.comboTimer / CONFIG.score.comboWindow})`
-    }
-
-    const compassEl = this.q<HTMLElement>('.hud-compass')
-    compassEl.classList.toggle('is-hidden', !compass)
-    if (compass) {
-      this.q<HTMLElement>('.hud-compass-arrow').style.transform = `rotate(${-compass.angle}rad)`
-      this.set('distance', this.i18n.t('hud.nearest', { m: Math.round(compass.distance) }))
-      compassEl.dataset.rise = compass.rise > 2 ? 'up' : compass.rise < -2 ? 'down' : ''
-    }
+    this.mini = q<HTMLCanvasElement>('.minimap canvas')
   }
 
-  popup(text: string, at: { x: number; y: number }, kind: 'score' | 'hurt'): void {
-    const el = document.createElement('div')
-    el.className = `popup popup-${kind}`
-    el.textContent = text
-    el.style.left = `${at.x}px`
-    el.style.top = `${at.y}px`
-    this.q('.popups').append(el)
-    el.addEventListener('animationend', () => el.remove())
+  private set(key: string, el: HTMLElement, html: string): void {
+    if (this.cache.get(key) === html) return
+    this.cache.set(key, html)
+    el.innerHTML = html
   }
 
-  hurt(): void {
-    const v = this.q('.hurt-vignette')
-    v.classList.remove('flash')
-    void (v as HTMLElement).offsetWidth
-    v.classList.add('flash')
+  private pushToast(t: Toast): void {
+    const box = this.hud.toasts
+    const d = el('div', `toast ${t.kind}`, t.text)
+    box.prepend(d)
+    while (box.children.length > 4) box.lastElementChild!.remove()
+    setTimeout(() => d.classList.add('out'), 3600)
+    setTimeout(() => d.remove(), 4200)
   }
 
-  hint(hint: Hint | null): void {
-    this.hintKey = hint
-    this.renderHint()
+  private pushFeed(e: FeedEntry): void {
+    const d = el('div', 'kill', `<b style="color:${TEAM_CSS[e.killerTeam] ?? '#ccc'}">${e.killer}</b><span class="w">${e.weapon}${e.head ? ' ✦爆头' : ''}</span><b style="color:${TEAM_CSS[e.victimTeam]}">${e.victim}</b>`)
+    if (e.killer === '你' || e.victim === '你') d.classList.add('me')
+    this.hud.feed.prepend(d)
+    while (this.hud.feed.children.length > 6) this.hud.feed.lastElementChild!.remove()
+    setTimeout(() => d.remove(), 7000)
   }
 
-  private renderHint(): void {
-    const el = this.q('.hint')
-    const hint = this.hintKey
-    if (!hint) {
-      el.classList.remove('is-active')
-      return
-    }
-    const method = this.input.method
-    const glyph = method === 'gamepad' ? GLYPH.gamepad : GLYPH.keyboard
-    const key = hint === 'cores' ? 'hint.cores' : `hint.${hint}.${method === 'touch' && hint === 'look' ? 'keyboard' : method}`
-    const vars = { keys: glyph.keys, stick: hint === 'look' ? GLYPH.gamepad.stickR : GLYPH.gamepad.keys, key: hint === 'dash' ? glyph.dash : glyph.jump }
-    el.querySelector('span')!.innerHTML = this.i18n.t(key, vars)
-    el.classList.add('is-active')
+  private showHit(kill: boolean, head: boolean): void {
+    const h = this.hud.hit
+    h.className = `hit on ${kill ? 'kill' : ''} ${head ? 'head' : ''}`
+    this.hitTimer = kill ? 0.35 : 0.15
   }
 
-  private banner(text: string): void {
-    const el = this.q('.banner')
-    el.textContent = text
-    el.classList.remove('show')
-    void (el as HTMLElement).offsetWidth
-    el.classList.add('show')
+  private showHurt(angle: number): void {
+    const d = el('div', 'hurt')
+    d.style.transform = `rotate(${-angle}rad)`
+    this.hud.hurts.appendChild(d)
+    this.hurtEls.push(d)
+    setTimeout(() => {
+      d.remove()
+      this.hurtEls = this.hurtEls.filter(x => x !== d)
+    }, 900)
+    this.screens.get('hud')!.classList.remove('flash')
+    void this.screens.get('hud')!.offsetWidth
+    this.screens.get('hud')!.classList.add('flash')
   }
 
-  // ─── results ────────────────────────────────────────────────────────────
-
-  showResults(run: RunState): void {
-    this.lastRun = run
-    this.savedRank = -1
-    const won = run.phase === 'won'
-    const el = this.q('[data-screen="results"]')
-    el.classList.toggle('is-won', won)
-    const titleKey = won ? 'results.won' : run.loseReason === 'time' ? 'results.lost.time' : 'results.lost.lives'
-    this.q('.results-title').setAttribute('data-i18n', titleKey)
-    const n = stars(run)
-    for (const [i, s] of this.qa('.results-stars .star').entries()) {
-      s.classList.toggle('is-on', i < n)
-      ;(s as HTMLElement).style.animationDelay = `${0.35 + i * 0.22}s`
-    }
-    const coreScore = run.score - run.timeBonus - run.lifeBonus
-    const fmt = (v: number) => v.toLocaleString(this.i18n.locale)
-    this.q('.r-cores').textContent = `${run.collected} / ${run.total}`
-    this.q('.r-core-score').textContent = fmt(coreScore)
-    this.q('.r-time').textContent = formatClock(run.elapsed)
-    this.q('.r-time-bonus').textContent = `+${fmt(run.timeBonus)}`
-    this.q('.r-life-bonus').textContent = `+${fmt(run.lifeBonus)}`
-    this.q('.r-total').textContent = fmt(run.score)
-    const best = this.save.data.leaderboard[0]?.score ?? 0
-    this.q('.results-best').classList.toggle('is-active', run.score > best && run.score > 0)
-    const form = this.q('.results-save')
-    form.classList.toggle('is-hidden', run.score <= 0 || insertScore(this.save.data.leaderboard, this.entry(run)).rank < 0)
-    form.classList.remove('is-saved')
-    this.q<HTMLInputElement>('.results-name').value = this.save.data.playerName
-    this.q('.results-rank').textContent = ''
-    this.translate()
-    this.show('results')
-  }
-
-  private entry(run: RunState) {
-    return { name: this.q<HTMLInputElement>('.results-name')?.value.trim().slice(0, 16) || this.save.data.playerName, score: run.score, seconds: Math.round(run.elapsed), at: Date.now() }
-  }
-
-  private saveScore(): void {
-    if (!this.lastRun || this.savedRank >= 0) return
-    const entry = this.entry(this.lastRun)
-    const { board, rank } = insertScore(this.save.data.leaderboard, entry)
-    this.save.update({ leaderboard: board, playerName: entry.name })
-    this.savedRank = rank
-    this.q('.results-save').classList.add('is-saved')
-    this.q('.results-rank').textContent = rank >= 0 ? this.i18n.t('results.rank', { rank: rank + 1 }) : ''
+  private click(): void {
+    this.audio.unlock()
     this.audio.play('ui')
   }
 
-  private renderLeaderboard(): void {
-    const list = this.q('.board')
-    const board = this.save.data.leaderboard
-    if (board.length === 0) {
-      list.innerHTML = `<li class="board-empty">${this.i18n.t('leaderboard.empty')}</li>`
-      return
+  /** Per-frame HUD refresh. */
+  update(dt: number, showBoard: boolean): void {
+    const g = this.game
+    if (!g || (this.current !== 'hud' && this.current !== 'pause' && this.current !== 'end')) return
+    const m = g.match
+    const p = g.player
+    const h = this.hud
+    const t = g.time
+    this.set('sc0', h.sc0, String(Math.floor(m.scores[0])))
+    this.set('sc1', h.sc1, String(Math.floor(m.scores[1])))
+    h.g0.style.width = `${Math.min(100, (m.scores[0] / CONFIG.match.targetScore) * 100)}%`
+    h.g1.style.width = `${Math.min(100, (m.scores[1] / CONFIG.match.targetScore) * 100)}%`
+    this.set('time', h.time, formatClock(m.timeLeft))
+    h.time.classList.toggle('warn', m.timeLeft < 60)
+    // Point chips.
+    m.points.forEach((s, i) => {
+      const chip = h.chips.children[i] as HTMLElement
+      const cls = `chip ${s.kind} o${s.owner} ${s.contested ? 'contested' : ''} ${s.capturing >= 0 && s.capturing !== s.owner ? `cap c${s.capturing}` : ''}`
+      if (chip.className !== cls) chip.className = cls
+      const fill = chip.querySelector('i') as HTMLElement
+      fill.style.width = `${s.progress * 100}%`
+      fill.style.background = s.owner >= 0 ? TEAM_CSS[s.owner] : s.progressTeam >= 0 ? TEAM_CSS[s.progressTeam] : '#e8edf2'
+    })
+    const egg = m.points[eggIndex(m)]
+    if (egg.owner >= 0) {
+      h.eggbar.className = `eggbar on t${egg.owner}`
+      this.set('eggl', h.eggLbl, `${TEAM_SHORT[egg.owner]}控制金蛋 · 守卫 ${Math.floor(m.eggHold)}/${CONFIG.match.eggHoldToWin} 秒`)
+      h.eggFill.style.width = `${(m.eggHold / CONFIG.match.eggHoldToWin) * 100}%`
+    } else h.eggbar.className = 'eggbar'
+    // Capture bar.
+    const zi = g.playerZone()
+    if (zi >= 0) {
+      const s = m.points[zi]
+      const pt = POINTS[zi]
+      h.capture.classList.add('on')
+      this.set('capn', h.capName, `${pt.short === '蛋' ? '' : pt.short + ' · '}${pt.name}`)
+      const mineOwned = s.owner === PLAYER_TEAM
+      let state = ''
+      if (s.contested) state = '争夺中 · 清除区域内敌人'
+      else if (mineOwned && s.progress >= 1) state = '已控制 · 守住据点'
+      else if (mineOwned) state = '加固中…'
+      else if (s.owner >= 0) state = '中立化敌方据点…'
+      else state = '占领中…'
+      this.set('caps', h.capState, state)
+      h.capState.className = `cap-state ${s.contested ? 'warn' : ''}`
+      const fillTeam = s.owner >= 0 ? s.owner : s.progressTeam
+      h.capFill.style.width = `${s.progress * 100}%`
+      h.capFill.style.background = fillTeam >= 0 ? TEAM_CSS[fillTeam] : '#e8edf2'
+    } else h.capture.classList.remove('on')
+    this.set('prompt', h.prompt, g.prompt)
+    h.prompt.classList.toggle('on', !!g.prompt)
+    // Vitals.
+    const alive = p.alive
+    h.respawn.classList.toggle('on', !alive && g.state === 'playing')
+    if (!alive) this.set('rsp', h.respawnT, `${Math.max(0, Math.ceil(p.respawnAt - t))} 秒后在红方部署区重新部署`)
+    const veh = g.activeVehicle
+    if (veh) {
+      this.set('hp', h.hp, String(Math.ceil(veh.hp)))
+      h.hpfill.style.width = `${(veh.hp / veh.maxHp) * 100}%`
+      h.shfill.style.width = '0%'
+    } else {
+      this.set('hp', h.hp, String(Math.ceil(p.hp)))
+      h.hpfill.style.width = `${(p.hp / p.maxHp) * 100}%`
+      h.shfill.style.width = `${Math.min(100, (p.shield / CONFIG.stations.shield) * 100)}%`
     }
-    list.innerHTML = board
-      .map((e, i) => `<li class="${i === this.savedRank ? 'is-me' : ''}"><b>${i + 1}</b><span class="board-name"></span><span>${formatClock(e.seconds)}</span><em>${e.score.toLocaleString(this.i18n.locale)}</em></li>`)
-      .join('')
-    // Names are player-entered text: assign via textContent, never innerHTML.
-    list.querySelectorAll('.board-name').forEach((el, i) => (el.textContent = board[i].name))
+    h.hp.parentElement!.classList.toggle('veh', !!veh)
+    h.lowhp.style.opacity = String(alive && !veh ? Math.max(0, 1 - p.hp / 45) * 0.9 : 0)
+    const buffs = (Object.keys(p.buffs) as SkillId[]).filter(k => p.buffs[k] > t)
+    this.set('buffs', h.buffs, buffs.map(k => `<div class="buff" style="--c:${SKILLS[k].color}"><b>${SKILLS[k].name}</b><span>${Math.ceil(p.buffs[k] - t)}s</span></div>`).join('') + (t < p.spawnShieldUntil ? '<div class="buff" style="--c:#fff"><b>部署保护</b></div>' : ''))
+    if (veh) {
+      this.set('wname', h.wname, `${veh.label} · 车载机枪`)
+      this.set('mag', h.mag, `${Math.round(Math.abs(veh.speed) * 3.6)}`)
+      this.set('res', h.res, 'km/h')
+      h.ammo.classList.add('veh')
+    } else {
+      this.set('wname', h.wname, CONFIG.weapon.name)
+      this.set('mag', h.mag, String(p.mag))
+      this.set('res', h.res, `/ ${Math.floor(p.reserve)}`)
+      h.ammo.classList.remove('veh')
+    }
+    h.mag.classList.toggle('low', !veh && p.mag <= 8)
+    this.set('gn', h.gn, String(p.grenades))
+    h.reload.classList.toggle('on', p.reloading)
+    // Crosshair.
+    const onFoot = p.mode === 'foot' || p.mode === 'heli'
+    const gap = 6 + p.spread(t) * 900
+    h.cross.style.setProperty('--gap', `${gap.toFixed(1)}px`)
+    h.cross.classList.toggle('ads', p.ads > 0.6)
+    h.cross.classList.toggle('off', !alive || p.mode === 'drone')
+    h.cross.classList.toggle('veh', !onFoot)
+    this.hitTimer -= dt
+    if (this.hitTimer <= 0) h.hit.classList.remove('on')
+    h.drone.classList.toggle('on', p.mode === 'drone')
+    // Markers.
+    this.updateMarkers(g.markers(window.innerWidth, window.innerHeight))
+    // Minimap (throttled).
+    this.miniTick -= dt
+    if (this.miniTick <= 0) {
+      this.miniTick = 0.08
+      this.drawMinimap(g)
+    }
+    h.board.classList.toggle('on', showBoard)
+    if (showBoard) {
+      const board = g.units.map(u => ({ name: u.name, team: u.team, kills: u.kills, deaths: u.deaths, captures: u.captures, isPlayer: u.isPlayer }))
+      this.set('board', h.board, `<div class="panel"><div class="panel-h">战况 · ${formatClock(m.timeLeft)}</div><div class="end-board">${this.boardHtml(board.sort((a, b) => b.kills - a.kills))}</div></div>`)
+    }
   }
 
-  private renderBest(): void {
-    const best = this.save.data.leaderboard[0]?.score ?? 0
-    const el = this.q('.title-best')
-    el.classList.toggle('is-hidden', best <= 0)
-    el.textContent = this.i18n.t('menu.best', { score: best.toLocaleString(this.i18n.locale) })
-  }
-
-  // ─── settings ───────────────────────────────────────────────────────────
-
-  /** Re-read the save into the Settings controls (call after changing settings outside the UI). */
-  refreshSettings(): void {
-    const d = this.save.data
-    this.q<HTMLInputElement>('[name="musicVolume"]').value = String(d.musicVolume)
-    this.q<HTMLInputElement>('[name="sfxVolume"]').value = String(d.sfxVolume)
-    this.q<HTMLInputElement>('[name="sensitivity"]').value = String(d.sensitivity)
-    for (const t of this.qa<HTMLButtonElement>('.toggle')) {
-      const on = d[t.dataset.setting as 'muted' | 'invertY' | 'reducedMotion'] === true
-      t.setAttribute('aria-pressed', String(on))
-      t.querySelector('span')!.setAttribute('data-i18n', on ? 'settings.on' : 'settings.off')
+  private updateMarkers(list: Marker[]): void {
+    const layer = this.hud.markers
+    while (this.markerPool.length < list.length) {
+      const d = el('div', 'mk')
+      layer.appendChild(d)
+      this.markerPool.push(d)
     }
-    for (const b of this.qa<HTMLButtonElement>('.seg button')) {
-      const key = b.parentElement!.dataset.setting as 'quality' | 'locale'
-      const current = key === 'locale' ? this.i18n.locale : d.quality
-      b.setAttribute('aria-pressed', String(b.dataset.value === current))
-    }
-    for (const r of this.qa<HTMLInputElement>('input[type="range"]')) r.style.setProperty('--fill', `${((Number(r.value) - Number(r.min)) / (Number(r.max) - Number(r.min))) * 100}%`)
-    this.translate()
-  }
-
-  // ─── events ─────────────────────────────────────────────────────────────
-
-  private onClick(e: MouseEvent): void {
-    const target = (e.target as HTMLElement).closest<HTMLElement>('[data-action], .toggle, .seg button')
-    if (!target) return
-    this.audio.unlock()
-    if (target.matches('.toggle')) {
-      const key = target.dataset.setting as 'muted' | 'invertY' | 'reducedMotion'
-      this.actions.settings({ [key]: !this.save.data[key] })
-      this.refreshSettings()
-      this.audio.play('ui')
-      return
-    }
-    if (target.matches('.seg button')) {
-      const key = target.parentElement!.dataset.setting
-      if (key === 'quality') this.actions.settings({ quality: target.dataset.value as Quality })
-      if (key === 'locale') this.actions.settings({ locale: target.dataset.value as Locale })
-      this.refreshSettings()
-      this.audio.play('ui')
-      return
-    }
-    const action = target.dataset.action
-    switch (action) {
-      case 'play': this.actions.play(); break
-      case 'resume': this.actions.resume(); break
-      case 'restart': this.actions.restart(); break
-      case 'quit': this.actions.quit(); break
-      case 'settings': this.push('settings'); break
-      case 'leaderboard': this.push('leaderboard'); break
-      case 'back': this.back(); break
-      case 'save-score': this.saveScore(); break
-      case 'pause': window.dispatchEvent(new CustomEvent('game:pause')); break
-    }
-  }
-
-  private onInput(e: Event): void {
-    const el = e.target as HTMLInputElement
-    if (el.type !== 'range') return
-    el.style.setProperty('--fill', `${((Number(el.value) - Number(el.min)) / (Number(el.max) - Number(el.min))) * 100}%`)
-    this.actions.settings({ [el.name]: Number(el.value) } as Partial<SaveData>)
-  }
-
-  private onKey(e: KeyboardEvent): void {
-    if (this.screen === 'hud' || this.screen === 'boot') return
-    const typing = (e.target as HTMLElement).matches?.('input[type="text"]')
-    if ((e.code === 'Escape' || (e.code === 'Backspace' && !typing)) && this.screen !== 'title') {
-      // The pause toggle in main.ts owns Escape on the pause screen itself.
-      if (this.screen !== 'pause' && this.screen !== 'results') {
-        e.preventDefault()
-        // Escape is also the pause toggle; consume it so leaving Settings doesn't resume the run.
-        this.input.consume('pause')
-        this.back()
+    this.markerPool.forEach((d, i) => {
+      const m = list[i]
+      if (!m) {
+        if (d.style.display !== 'none') d.style.display = 'none'
+        return
       }
-      return
+      d.style.display = ''
+      d.style.transform = `translate(${m.x.toFixed(1)}px, ${m.y.toFixed(1)}px)`
+      const cls = `mk ${m.kind} ${m.edge ? 'edge' : ''}`
+      if (d.className !== cls) d.className = cls
+      d.style.setProperty('--c', m.color)
+      const html = m.kind === 'point'
+        ? `<b>${m.label}</b><span>${Math.round(m.dist)}m</span>`
+        : m.kind === 'ally' ? (m.dist < 35 ? `<span>${m.label}</span>` : '')
+        : m.kind === 'enemy' ? '' : `<span>${m.label}${m.dist > 8 ? ` ${Math.round(m.dist)}m` : ''}</span>`
+      if (d.dataset.h !== html) {
+        d.dataset.h = html
+        d.innerHTML = html
+      }
+    })
+  }
+
+  // ─── minimap ────────────────────────────────────────────────────────────
+  private mm(x: number, z: number): [number, number] {
+    const W = this.mini.width, H = this.mini.height
+    const minX = LAND.minX - 6, maxX = LAND.maxX + 6, minZ = SEA.minZ + 60, maxZ = LAND.maxZ + 4
+    return [((x - minX) / (maxX - minX)) * W, ((z - minZ) / (maxZ - minZ)) * H]
+  }
+
+  private buildMiniBg(): HTMLCanvasElement {
+    const c = document.createElement('canvas')
+    c.width = this.mini.width
+    c.height = this.mini.height
+    const g = c.getContext('2d')!
+    g.fillStyle = '#123447'
+    g.fillRect(0, 0, c.width, c.height)
+    const [, sy] = this.mm(0, SHORE_Z)
+    g.fillStyle = '#2c3a38'
+    g.fillRect(0, sy, c.width, c.height - sy)
+    g.fillStyle = 'rgba(126,249,255,0.25)'
+    g.fillRect(0, sy - 1, c.width, 2)
+    g.strokeStyle = '#4b5760'
+    for (const r of ROADS) {
+      const [x0, y0] = this.mm(r.x0, r.z0)
+      const [x1, y1] = this.mm(r.x1, r.z1)
+      g.lineWidth = r.w * 0.8
+      g.beginPath()
+      g.moveTo(x0, y0)
+      g.lineTo(x1, y1)
+      g.stroke()
     }
-    if (e.code === 'ArrowDown' || e.code === 'ArrowUp') {
-      e.preventDefault()
-      this.moveFocus(e.code === 'ArrowDown' ? 1 : -1)
+    for (const b of BUILDINGS) {
+      const [x0, y0] = this.mm(b.x - b.w / 2, b.z - b.d / 2)
+      const [x1, y1] = this.mm(b.x + b.w / 2, b.z + b.d / 2)
+      g.fillStyle = b.style === 'pavilion' ? '#8a6040' : b.style === 'lab' ? '#46607a' : b.style === 'club' ? '#3f7a5a' : '#6d7f8c'
+      g.fillRect(x0, y0, x1 - x0, y1 - y0)
     }
-  }
-
-  /** Per-frame gamepad menu navigation (keyboard uses native focus + onKey). */
-  frame(frameSeconds: number): void {
-    if (this.input.method !== this.lastMethod) {
-      this.lastMethod = this.input.method
-      this.renderPrompts()
-      this.renderHint()
+    for (const b of BASES) {
+      const [x, y] = this.mm(b.x, b.z)
+      g.fillStyle = b.team === 0 ? 'rgba(255,77,94,0.35)' : 'rgba(63,169,255,0.35)'
+      g.beginPath()
+      g.arc(x, y, b.r * 0.8, 0, Math.PI * 2)
+      g.fill()
     }
-    if (this.screen === 'hud' || this.screen === 'boot') return
-    if (this.input.method !== 'gamepad') {
-      this.input.consume('confirm')
-      this.input.consume('back')
-      return
+    const icon = (x: number, z: number, color: string, glyph: string) => {
+      const [px, py] = this.mm(x, z)
+      g.fillStyle = color
+      g.font = '700 9px "Noto Sans SC", sans-serif'
+      g.textAlign = 'center'
+      g.textBaseline = 'middle'
+      g.fillText(glyph, px, py)
     }
-    const y = this.input.move.y
-    const x = this.input.move.x
-    this.navRepeat = Math.max(0, this.navRepeat - frameSeconds)
-    const active = document.activeElement as HTMLElement | null
-    if (Math.abs(y) > 0.6 && this.navRepeat <= 0) {
-      this.moveFocus(y < 0 ? 1 : -1)
-      this.navRepeat = 0.22
-    } else if (Math.abs(x) > 0.6 && this.navRepeat <= 0 && active?.matches('input[type="range"]')) {
-      const r = active as HTMLInputElement
-      r.value = String(Number(r.value) + Math.sign(x) * Number(r.step || 0.1))
-      r.dispatchEvent(new Event('input', { bubbles: true }))
-      this.navRepeat = 0.12
-    } else if (Math.abs(x) > 0.6 && this.navRepeat <= 0 && active?.parentElement?.matches('.seg')) {
-      const sib = (Math.sign(x) > 0 ? active.nextElementSibling : active.previousElementSibling) as HTMLElement | null
-      sib?.focus()
-      this.navRepeat = 0.22
-    } else if (Math.abs(y) < 0.3 && Math.abs(x) < 0.3) {
-      this.navRepeat = 0
+    for (const s of STATIONS) icon(s.x, s.z, s.kind === 'supply' ? '#ffa94d' : s.kind === 'heal' ? '#5cff9d' : SKILLS[s.skill!].color, s.kind === 'supply' ? '补' : s.kind === 'heal' ? '血' : '技')
+    for (const d of DRONE_PADS) icon(d.x, d.z, '#7ef9ff', '◇')
+    for (const h of HELIPADS) icon(h.x, h.z, h.team === 0 ? '#ff8a96' : '#8ccaff', 'H')
+    return c
+  }
+
+  private drawMinimap(game: Game): void {
+    const c = this.mini
+    const g = c.getContext('2d')!
+    if (!this.miniBg) this.miniBg = this.buildMiniBg()
+    g.drawImage(this.miniBg, 0, 0)
+    const m = game.match
+    POINTS.forEach((p, i) => {
+      const s = m.points[i]
+      const [x, y] = this.mm(p.x, p.z)
+      const col = s.contested ? '#ffd35c' : s.owner >= 0 ? TEAM_CSS[s.owner] : '#e8edf2'
+      g.strokeStyle = col
+      g.lineWidth = 2
+      g.beginPath()
+      g.arc(x, y, p.r * 0.8, 0, Math.PI * 2)
+      g.stroke()
+      g.fillStyle = col
+      g.font = `800 ${p.kind === 'egg' ? 10 : 9}px "Noto Sans SC", sans-serif`
+      g.textAlign = 'center'
+      g.textBaseline = 'middle'
+      g.fillText(p.short, x, y)
+    })
+    const t = game.time
+    for (const v of game.vehicles) {
+      if (!v.alive) continue
+      const [x, y] = this.mm(v.pos.x, v.pos.z)
+      g.fillStyle = v.driver ? '#ffffff' : v.kind === 'car' ? '#c9d4dd' : '#a9e4ff'
+      g.fillRect(x - 2.5, y - 2.5, 5, 5)
     }
-    if (this.input.consume('confirm')) active?.click()
-    if (this.input.consume('back') && this.screen !== 'title') this.back()
-  }
-
-  private navItems(): HTMLElement[] {
-    const screen = this.q(`[data-screen="${this.screen}"]`)
-    return [...screen.querySelectorAll<HTMLElement>('[data-nav]')].filter(el => el.offsetParent !== null && !el.closest('.is-hidden'))
-  }
-
-  private moveFocus(dir: 1 | -1): void {
-    const items = this.navItems()
-    if (items.length === 0) return
-    // Buttons inside one segmented control count as a single row.
-    const rows: HTMLElement[][] = []
-    for (const el of items) {
-      const seg = el.parentElement?.matches('.seg') ? el.parentElement : null
-      const last = rows[rows.length - 1]
-      if (seg && last && last[0].parentElement === seg) last.push(el)
-      else rows.push([el])
+    for (const h of game.helis) {
+      if (!h.alive) continue
+      const [x, y] = this.mm(h.pos.x, h.pos.z)
+      g.strokeStyle = TEAM_CSS[h.team]
+      g.lineWidth = 1.5
+      g.beginPath()
+      g.moveTo(x - 5, y)
+      g.lineTo(x + 5, y)
+      g.moveTo(x, y - 5)
+      g.lineTo(x, y + 5)
+      g.stroke()
     }
-    const current = rows.findIndex(r => r.includes(document.activeElement as HTMLElement))
-    const next = rows[(current + dir + rows.length) % rows.length]
-    ;(next.find(el => el.getAttribute('aria-pressed') === 'true') ?? next[0]).focus()
-  }
-
-  // ─── helpers ────────────────────────────────────────────────────────────
-
-  private translate(): void {
-    for (const el of this.root.querySelectorAll<HTMLElement>('[data-i18n]')) el.textContent = this.i18n.t(el.dataset.i18n!)
-    for (const el of this.root.querySelectorAll<HTMLElement>('[data-i18n-label]')) el.setAttribute('aria-label', this.i18n.t(el.dataset.i18nLabel!))
-    for (const el of this.root.querySelectorAll<HTMLInputElement>('[data-i18n-placeholder]')) el.placeholder = this.i18n.t(el.dataset.i18nPlaceholder!)
-    this.renderPrompts()
-    this.renderHint()
-    if (this.screen === 'title') this.renderBest()
-    if (this.screen === 'leaderboard') this.renderLeaderboard()
-    this.hudCache.clear()
-    document.title = this.i18n.t('game.title')
-  }
-
-  /** Bottom-bar button prompts follow the active input method. */
-  renderPrompts(): void {
-    const g = this.input.method === 'gamepad' ? GLYPH.gamepad : GLYPH.keyboard
-    const html = this.input.method === 'touch' ? '' : `<span>${g.select} ${this.i18n.t('prompt.select')}</span><span>${g.back} ${this.i18n.t('prompt.back')}</span>`
-    for (const el of this.qa('.prompts')) el.innerHTML = html
-  }
-
-  /** Update a HUD text slot only when it changed; returns true if it did. */
-  private set(slot: string, html: string): boolean {
-    if (this.hudCache.get(slot) === html) return false
-    this.hudCache.set(slot, html)
-    this.q(`[data-slot="${slot}"]`).innerHTML = html
-    return true
-  }
-
-  private q<T extends HTMLElement = HTMLElement>(sel: string): T {
-    return this.root.querySelector<T>(sel)!
-  }
-
-  private qa<T extends HTMLElement = HTMLElement>(sel: string): T[] {
-    return [...this.root.querySelectorAll<T>(sel)]
-  }
-
-  private template(): string {
-    const range = (name: string, label: string, min: number, max: number, step: number) =>
-      `<label class="row"><span data-i18n="${label}"></span><input data-nav type="range" name="${name}" min="${min}" max="${max}" step="${step}"></label>`
-    const toggle = (setting: string, label: string) =>
-      `<div class="row"><span data-i18n="${label}"></span><button data-nav class="toggle" data-setting="${setting}" aria-pressed="false"><i></i><span></span></button></div>`
-    return /* html */ `
-<section class="screen screen-boot is-active" data-screen="boot">
-  <div class="boot-logo" data-i18n="game.title"></div>
-  <div class="boot-bar"><i></i></div>
-  <div class="boot-label" data-i18n="boot.loading"></div>
-</section>
-
-<section class="screen screen-title" data-screen="title">
-  <div class="title-vignette"></div>
-  <div class="title-best is-hidden"></div>
-  <div class="title-block">
-    <div class="logo">
-      <span class="logo-gem">${ICON.core}</span>
-      <h1 class="logo-text" data-i18n="game.title"></h1>
-    </div>
-    <p class="tagline" data-i18n="game.tagline"></p>
-    <nav class="menu">
-      <button data-nav class="btn btn-primary" data-action="play"><span data-i18n="menu.play"></span></button>
-      <button data-nav class="btn" data-action="leaderboard"><span data-i18n="menu.leaderboard"></span></button>
-      <button data-nav class="btn" data-action="settings"><span data-i18n="menu.settings"></span></button>
-    </nav>
-  </div>
-  <footer class="bottom-bar"><div class="prompts"></div><small data-i18n="credits.fonts"></small></footer>
-</section>
-
-<section class="screen screen-hud" data-screen="hud">
-  <div class="hurt-vignette"></div>
-  <div class="popups"></div>
-  <div class="hud-top-left">
-    <div class="hud-panel hud-cores"><span class="hud-core-icon">${ICON.core}</span><b data-slot="cores"></b></div>
-    <div class="hud-score"><span data-i18n="hud.score"></span><b data-slot="score"></b></div>
-  </div>
-  <div class="hud-top-center">
-    <div class="hud-clock"><b data-slot="clock"></b></div>
-    <div class="hud-compass"><span class="hud-compass-arrow">${ICON.arrow}</span><b data-slot="distance"></b></div>
-  </div>
-  <div class="hud-top-right">
-    <div class="hud-cells">${`<span class="hud-cell">${ICON.cell}</span>`.repeat(CONFIG.run.lives)}</div>
-    <button class="hud-pause" data-action="pause" data-i18n-label="touch.pause">${ICON.pause}</button>
-  </div>
-  <div class="hud-combo"><b data-slot="combo"></b><span data-i18n="hud.combo"></span><div class="hud-combo-bar"><i></i></div></div>
-  <div class="banner"></div>
-  <div class="hint"><span></span></div>
-  <div class="touch">
-    <div class="touch-stick"><i></i></div>
-    <button class="touch-btn touch-dash" data-touch="dash"><span data-i18n="touch.dash"></span></button>
-    <button class="touch-btn touch-jump" data-touch="jump"><span data-i18n="touch.jump"></span></button>
-  </div>
-</section>
-
-<section class="screen screen-pause screen-modal" data-screen="pause">
-  <div class="modal">
-    <h2 class="modal-title" data-i18n="pause.title"></h2>
-    <nav class="menu">
-      <button data-nav class="btn btn-primary" data-action="resume"><span data-i18n="menu.continue"></span></button>
-      <button data-nav class="btn" data-action="restart"><span data-i18n="menu.restart"></span></button>
-      <button data-nav class="btn" data-action="settings"><span data-i18n="menu.settings"></span></button>
-      <button data-nav class="btn" data-action="quit"><span data-i18n="menu.quit"></span></button>
-    </nav>
-  </div>
-  <footer class="bottom-bar"><div class="prompts"></div></footer>
-</section>
-
-<section class="screen screen-settings screen-modal" data-screen="settings">
-  <div class="modal modal-wide">
-    <h2 class="modal-title" data-i18n="settings.title"></h2>
-    <div class="settings-grid">
-      <fieldset><legend data-i18n="settings.audio"></legend>
-        ${range('musicVolume', 'settings.music', 0, 1, 0.05)}
-        ${range('sfxVolume', 'settings.sfx', 0, 1, 0.05)}
-        ${toggle('muted', 'settings.mute')}
-      </fieldset>
-      <fieldset><legend data-i18n="settings.controls"></legend>
-        ${range('sensitivity', 'settings.sensitivity', 0.2, 3, 0.1)}
-        ${toggle('invertY', 'settings.invertY')}
-      </fieldset>
-      <fieldset><legend data-i18n="settings.display"></legend>
-        <div class="row"><span data-i18n="settings.quality"></span><div class="seg" data-setting="quality">
-          <button data-nav data-value="low" data-i18n="settings.quality.low"></button><button data-nav data-value="medium" data-i18n="settings.quality.medium"></button><button data-nav data-value="high" data-i18n="settings.quality.high"></button>
-        </div></div>
-        ${toggle('reducedMotion', 'settings.reducedMotion')}
-        <div class="row"><span data-i18n="settings.language"></span><div class="seg" data-setting="locale">
-          <button data-nav data-value="en" lang="en">English</button><button data-nav data-value="zh-CN" lang="zh-CN">简体中文</button>
-        </div></div>
-      </fieldset>
-    </div>
-    <nav class="menu menu-row"><button data-nav class="btn" data-action="back"><span data-i18n="menu.back"></span></button></nav>
-  </div>
-  <footer class="bottom-bar"><div class="prompts"></div></footer>
-</section>
-
-<section class="screen screen-leaderboard screen-modal" data-screen="leaderboard">
-  <div class="modal">
-    <h2 class="modal-title" data-i18n="leaderboard.title"></h2>
-    <div class="board-head"><b>#</b><span></span><span data-i18n="leaderboard.time"></span><em data-i18n="leaderboard.score"></em></div>
-    <ol class="board"></ol>
-    <nav class="menu menu-row"><button data-nav class="btn" data-action="back"><span data-i18n="menu.back"></span></button></nav>
-  </div>
-  <footer class="bottom-bar"><div class="prompts"></div></footer>
-</section>
-
-<section class="screen screen-results screen-modal" data-screen="results">
-  <div class="modal modal-results">
-    <div class="results-stars">${`<span class="star">${ICON.star}</span>`.repeat(3)}</div>
-    <h2 class="results-title modal-title"></h2>
-    <div class="results-best" data-i18n="results.newBest"></div>
-    <dl class="results-table">
-      <div><dt data-i18n="results.cores"></dt><dd class="r-cores"></dd><dd class="r-core-score"></dd></div>
-      <div><dt data-i18n="results.time"></dt><dd class="r-time"></dd><dd></dd></div>
-      <div class="r-bonus"><dt data-i18n="results.timeBonus"></dt><dd></dd><dd class="r-time-bonus"></dd></div>
-      <div class="r-bonus"><dt data-i18n="results.lifeBonus"></dt><dd></dd><dd class="r-life-bonus"></dd></div>
-      <div class="r-total-row"><dt data-i18n="results.total"></dt><dd></dd><dd class="r-total"></dd></div>
-    </dl>
-    <div class="results-save">
-      <input data-nav class="results-name" type="text" maxlength="16" autocomplete="off" spellcheck="false" data-i18n-placeholder="results.name">
-      <button data-nav class="btn btn-small" data-action="save-score"><span data-i18n="results.save"></span></button>
-      <span class="results-saved" data-i18n="results.saved"></span>
-      <span class="results-rank"></span>
-    </div>
-    <nav class="menu menu-row">
-      <button data-nav class="btn btn-primary" data-action="restart"><span data-i18n="results.retry"></span></button>
-      <button data-nav class="btn" data-action="quit"><span data-i18n="results.title"></span></button>
-    </nav>
-  </div>
-</section>`
+    const p = game.player
+    for (const u of game.units) {
+      if (!u.alive || u === p) continue
+      const ally = u.team === p.team
+      if (!ally && u.spottedUntil <= t) continue
+      const [x, y] = this.mm(u.pos.x, u.pos.z)
+      g.fillStyle = TEAM_CSS[u.team]
+      g.beginPath()
+      g.arc(x, y, ally ? 2.4 : 3, 0, Math.PI * 2)
+      g.fill()
+    }
+    if (p.mode === 'drone') {
+      const d = game.drone
+      const [x, y] = this.mm(d.pos.x, d.pos.z)
+      const [rx] = this.mm(d.pos.x + CONFIG.drone.markRadius, 0)
+      g.strokeStyle = 'rgba(126,249,255,0.8)'
+      g.setLineDash([3, 3])
+      g.beginPath()
+      g.arc(x, y, rx - x, 0, Math.PI * 2)
+      g.stroke()
+      g.setLineDash([])
+    }
+    if (p.alive || p.mode === 'dead') {
+      const [x, y] = this.mm(p.pos.x, p.pos.z)
+      const yaw = p.mode === 'vehicle' && game.activeVehicle ? game.activeVehicle.yaw + Math.PI : p.yaw
+      g.save()
+      g.translate(x, y)
+      g.rotate(-yaw)
+      g.fillStyle = '#fff'
+      g.beginPath()
+      g.moveTo(0, -6)
+      g.lineTo(4, 4)
+      g.lineTo(0, 2)
+      g.lineTo(-4, 4)
+      g.closePath()
+      g.fill()
+      g.restore()
+    }
   }
 }

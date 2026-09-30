@@ -1,59 +1,17 @@
-# game-3d starter (three.js + Rapier)
+# 金蛋争夺战：科学园前线
 
-A complete, small 3D game — **Sky Cores**: run, jump and dash across floating islands to collect
-every energy core before the clock runs out, avoiding patrol drones. It exists to be *changed*:
-the engine layer is fixed scaffolding, the game layer is the part you rewrite.
+以香港科学园临海园区为灵感的原创低多边形 3D 第一人称据点射击（Three.js + TypeScript + Vite）。单人对 AI，开局即玩，无需登录联网。
 
-```bash
-pnpm install
-pnpm dev      # http://localhost:5173
-pnpm build    # typecheck + production build + bundle budget
-pnpm test     # unit tests (rules, save, i18n, level)
-pnpm smoke    # after build: headless browser playthrough + screenshots in shots/
-```
+## 玩法
+- 红方·赤焰 vs 蓝方·海鹰，各 6 人，争夺 A/B/C/D 四个建筑据点与中央「金蛋」（高锟会议中心）。
+- 胜利：先到 1000 分；或占领金蛋并连续守住 120 秒；时间耗尽时积分领先方获胜。
+- 餐厅 = 补给点（弹药 + 手雷）；科技公司/实验室 = 技能点（冲刺、护盾、扫描、稳定器）；会所 = 回血点。
+- 园区道路上的轻型战车、两侧码头的登陆快艇、屋顶无人机起降点（俯视侦察、标记敌人、呼叫直升机）、停机坪直升机（机降转移 / 环绕火力支援）。
 
-## Layout
+## 操作
+WASD 移动/驾驶 · 鼠标瞄准 · 左键射击 · 右键机瞄 · R 换弹 · Shift 冲刺 · 空格跳跃 · C/Ctrl 蹲伏 · G 手雷 · E/F 交互（上下载具、起飞无人机、登直升机）· 1-5 选择直升机目标 · Tab 战况 · Esc/P 暂停
 
-| Path | Role | Change it? |
-| --- | --- | --- |
-| `src/engine/loop.ts` | Fixed 60 Hz simulation + interpolated rendering | Rarely |
-| `src/engine/input.ts` | Keyboard/mouse, gamepad, touch → one action state | Add actions here |
-| `src/engine/physics.ts` | Rapier world, collider helpers, render interpolation | Rarely |
-| `src/engine/renderer.ts` | WebGL renderer, quality presets, bloom | Rarely |
-| `src/engine/audio.ts` | Music/SFX buses, synthesized SFX, `load()` for files | Add sounds |
-| `src/engine/save.ts` | Versioned localStorage save + leaderboard | Add fields + parsing |
-| `src/engine/i18n.ts` | en / zh-CN, browser detection, saved choice wins | Rarely |
-| `src/engine/assets.ts` | Cached GLTF/texture loading with progress | Use it for models |
-| `src/game/config.ts` | **All tuning numbers** | Yes |
-| `src/game/rules.ts` | Pure score/lives/clock/win rules (unit tested) | Yes |
-| `src/game/world.ts` | Level layout, sky, lights, islands, stones, lifts | Yes |
-| `src/game/player.ts` | Character controller + game feel + procedural model | Yes |
-| `src/game/*.ts` | Camera, cores, drones, particles, scene orchestration | Yes |
-| `src/ui/`, `src/styles/main.css` | HTML/CSS title, HUD, pause, settings, results | Yes |
-| `src/i18n/*.json` | All player-facing text (both files, same keys) | Yes |
-
-## Rules for changes
-
-- **Simulation in `step()`, visuals in `render()`/`animate()`.** Gameplay state only changes in
-  fixed steps; read presses there with `input.consume(action)`, never `pressed()`.
-- **Rules stay pure.** Scoring, win/lose and progression go in `rules.ts` with tests; scene code
-  reports events and reads state.
-- **Every visible string is an i18n key** in both `en.json` and `zh-CN.json` (a test enforces
-  matching keys and placeholders). Chinese glyphs come from the subset font in `public/fonts/`;
-  if you add new Chinese text, check it renders (missing glyphs fall back to system fonts).
-- **UI is HTML/CSS**, not canvas. Keep the game look: display font, outlined text, hard offset
-  shadows, skewed buttons, notched panels. Menus must stay keyboard/gamepad navigable
-  (`data-nav` on focusable controls).
-- **Colliders come from the helpers** in `physics.ts` with the same sizes as the meshes.
-- Keep `npm run build` within budget (`scripts/check-size.mjs`) and `npm run smoke` green.
-
-## Controls
-
-Keyboard/mouse: WASD move, mouse look (click to capture), Space jump (hold = higher), Shift
-sprint, F or left click dash, Esc pause. Gamepad: left stick, right stick, A jump, X/RB dash,
-LB sprint, Start pause. Touch: left-side stick, right-side drag to look, JUMP / DASH buttons.
-
-## Credits
-
-Fonts: Sora, Figtree, Noto Sans SC — SIL Open Font License 1.1 (see `public/fonts/*-OFL.txt`).
-Libraries: three.js (MIT), Rapier (Apache-2.0).
+## 开发
+- `pnpm dev`（PORT=3000 HOST=0.0.0.0）· `pnpm build` → `dist` · `pnpm test`（规则/存档单测）
+- `node scripts/smoke.mjs`：无头浏览器端到端冒烟测试（先 build；或设 `SMOKE_URL` 指向开发服务器）
+- 所有可调参数在 `src/game/config.ts`；地图布局在 `src/game/map.ts`。

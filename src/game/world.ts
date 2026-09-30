@@ -1,408 +1,726 @@
 import * as THREE from 'three'
-import type { Physics } from '../engine/physics'
-import { RAPIER } from '../engine/physics'
+import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js'
+import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
+import { Collision } from './collide'
+import { TEAM_CSS, TEAM_COLORS } from './config'
+import {
+  BASES, BOAT_SPAWNS, BUILDINGS, DRONE_PADS, EGG, HELIPADS, LAND, PIERS, POINTS, ROADS, SHORE_Z, SKILLS, STATIONS,
+  WATER_Y, type BuildingDef, type StationDef,
+} from './map'
+import { badgeTexture, eggTexture, facadeTextures, groundTexture, helipadTexture, labelSprite, signMesh, skyTexture } from './textures'
 
-/**
- * Procedural sky-islands level. Everything is built from primitives and a seeded RNG, so the
- * starter ships no model files and the layout is identical on every load.
- *
- * To make a different level, edit ISLANDS / LINKS: stepping stones are generated automatically
- * so every link stays jumpable with the tuning in config.ts.
- */
-export type Island = { x: number; z: number; top: number; r: number; cores: number; decor?: boolean }
-type Link = { a: number; b: number; kind: 'stones' | 'mover' }
+const UNIT = new THREE.BoxGeometry(1, 1, 1)
+const NEUTRAL = 0xe8edf2
 
-export const ISLANDS: Island[] = [
-  { x: 0, z: 0, top: 0, r: 7, cores: 2, decor: true },
-  { x: 15, z: 3, top: 1.5, r: 4, cores: 2, decor: true },
-  { x: 24, z: -8, top: 3.2, r: 3.5, cores: 2 },
-  { x: 14, z: -19, top: 4.8, r: 4.5, cores: 2, decor: true },
-  { x: 0, z: -27, top: 6.5, r: 5, cores: 2, decor: true },
-  { x: -15, z: -16, top: 4.5, r: 4, cores: 2, decor: true },
-  { x: -23, z: 1, top: 2.8, r: 3.5, cores: 2 },
-  { x: -11, z: 17, top: 1.2, r: 4.5, cores: 2, decor: true },
-  { x: 7, z: 17, top: 2.5, r: 3.5, cores: 2 },
-  // Summit: reached by the lift from island 4.
-  { x: 0, z: -12, top: 10.5, r: 3, cores: 3 },
-]
+export type PointVisual = { ring: THREE.Mesh; disk: THREE.Mesh; beam: THREE.Mesh; badge: THREE.Sprite; badgeTex: THREE.Texture[] }
+export type StationVisual = { def: StationDef; ring: THREE.Mesh; icon: THREE.Sprite; baseY: number }
 
-const LINKS: Link[] = [
-  { a: 0, b: 1, kind: 'stones' },
-  { a: 1, b: 2, kind: 'stones' },
-  { a: 2, b: 3, kind: 'stones' },
-  { a: 3, b: 4, kind: 'stones' },
-  { a: 4, b: 5, kind: 'stones' },
-  { a: 5, b: 6, kind: 'stones' },
-  { a: 6, b: 7, kind: 'mover' },
-  { a: 7, b: 8, kind: 'stones' },
-  { a: 8, b: 0, kind: 'stones' },
-  { a: 4, b: 9, kind: 'mover' },
-]
-
-const STONE = 1.8
-const MAX_GAP = 2.3
-const MAX_RISE = 1.05
-
-export const PALETTE = {
-  skyTop: new THREE.Color('#2f6fd6'),
-  horizon: new THREE.Color('#ffd9b0'),
-  grass: new THREE.Color('#79cf6e'),
-  grassDark: new THREE.Color('#4fae5e'),
-  rock: new THREE.Color('#8b6b58'),
-  rockDark: new THREE.Color('#5d4639'),
-  stone: new THREE.Color('#e3cfa6'),
-  leaf: [new THREE.Color('#3f9a57'), new THREE.Color('#5bb85d'), new THREE.Color('#e0a44a')],
-  trunk: new THREE.Color('#7a4f35'),
-  crystal: new THREE.Color('#7ee8ff'),
-}
-
-/** Mulberry32: tiny deterministic RNG so the level never changes between loads. */
-export function rng(seed: number): () => number {
-  let a = seed >>> 0
-  return () => {
-    a = (a + 0x6d2b79f5) >>> 0
-    let t = a
-    t = Math.imul(t ^ (t >>> 15), t | 1)
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
-  }
-}
-
-/**
- * Plan stepping stones between two islands so every hop fits the jump: the smallest count whose
- * edge-to-edge gap and per-hop rise are within MAX_GAP / MAX_RISE. Pure; unit tested.
- */
-export function planStones(a: Island, b: Island): { x: number; z: number; top: number }[] {
-  const dx = b.x - a.x
-  const dz = b.z - a.z
-  const d = Math.hypot(dx, dz)
-  const gap = d - a.r - b.r
-  const dy = b.top - a.top
-  let n = 0
-  while ((gap - n * STONE) / (n + 1) > MAX_GAP || Math.abs(dy) / (n + 1) > MAX_RISE) n += 1
-  const g = (gap - n * STONE) / (n + 1)
-  const out: { x: number; z: number; top: number }[] = []
-  for (let i = 1; i <= n; i += 1) {
-    const along = a.r + g * i + STONE * (i - 0.5)
-    out.push({ x: a.x + (dx / d) * along, z: a.z + (dz / d) * along, top: a.top + (dy * i) / (n + 1) })
-  }
-  return out
-}
-
-export type MovingPlatform = {
-  mesh: THREE.Mesh
-  body: RAPIER.RigidBody
-  from: THREE.Vector3
-  to: THREE.Vector3
-  period: number
-  phase: number
-  /** Movement applied during the last fixed step; the player adds it while standing on top. */
-  delta: THREE.Vector3
-  half: THREE.Vector3
-}
-
-export type DroneRoute = { center: THREE.Vector3; radius: number; phase: number; dir: 1 | -1 }
-
+/** Builds the Science Park battlefield: meshes into the scene, solids into the collision world. */
 export class World {
-  readonly scene = new THREE.Scene()
+  readonly col = new Collision()
   readonly sun: THREE.DirectionalLight
-  readonly spawn = new THREE.Vector3(0, 1.2, 3)
-  readonly coreSpots: THREE.Vector3[] = []
-  readonly droneRoutes: DroneRoute[] = []
-  readonly movers: MovingPlatform[] = []
-  private clouds: THREE.Object3D[] = []
+  readonly points: PointVisual[] = []
+  readonly stations: StationVisual[] = []
+  readonly padIcons: THREE.Sprite[] = []
+  private sea!: THREE.Mesh
+  private seaBase!: Float32Array
+  private readonly mats: Record<string, THREE.Material>
+  private facadeCache = new Map<number, [THREE.CanvasTexture, THREE.CanvasTexture]>()
 
-  constructor(private readonly physics: Physics, shadowMapSize: number) {
-    const random = rng(1337)
-    this.scene.background = PALETTE.horizon.clone()
-    this.scene.fog = new THREE.Fog(PALETTE.horizon, 45, 150)
-
-    this.scene.add(this.makeSky())
-    this.scene.add(new THREE.HemisphereLight('#cfe8ff', '#6b5242', 1.0))
-    this.sun = new THREE.DirectionalLight('#fff0d8', 2.1)
+  constructor(readonly scene: THREE.Scene, renderer: THREE.WebGLRenderer) {
+    const pmrem = new THREE.PMREMGenerator(renderer)
+    scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture
+    scene.environmentIntensity = 0.55
+    scene.fog = new THREE.Fog(0xaec3cf, 190, 900)
+    const sky = new THREE.Mesh(new THREE.SphereGeometry(900, 24, 16), new THREE.MeshBasicMaterial({ map: skyTexture(), side: THREE.BackSide, fog: false, depthWrite: false }))
+    scene.add(sky)
+    scene.add(new THREE.HemisphereLight(0xcfe6ff, 0x5b5146, 0.95))
+    this.sun = new THREE.DirectionalLight(0xffe0b8, 2.25)
     this.sun.castShadow = true
-    this.sun.shadow.mapSize.set(shadowMapSize, shadowMapSize)
     const cam = this.sun.shadow.camera
-    cam.left = cam.bottom = -26
-    cam.right = cam.top = 26
-    cam.near = 1
-    cam.far = 90
-    this.sun.shadow.bias = -0.0004
+    cam.left = cam.bottom = -75
+    cam.right = cam.top = 75
+    cam.near = 10
+    cam.far = 400
+    this.sun.shadow.bias = -0.0006
     this.sun.shadow.normalBias = 0.03
-    this.scene.add(this.sun, this.sun.target)
+    scene.add(this.sun, this.sun.target)
+    const sunDisc = new THREE.Mesh(new THREE.CircleGeometry(40, 32), new THREE.MeshBasicMaterial({ color: 0xffe6b8, fog: false, toneMapped: false }))
+    sunDisc.position.set(-620, 190, -380)
+    sunDisc.lookAt(0, 0, 0)
+    scene.add(sunDisc)
 
-    ISLANDS.forEach((island, i) => this.addIsland(island, i, random))
-    for (const link of LINKS) {
-      const a = ISLANDS[link.a]
-      const b = ISLANDS[link.b]
-      if (link.kind === 'stones') this.addStones(a, b, random)
-      else this.addMover(a, b, link.a * 7 + link.b)
+    this.mats = {
+      concrete: new THREE.MeshStandardMaterial({ color: 0xd8d5cc, roughness: 0.92 }),
+      white: new THREE.MeshStandardMaterial({ color: 0xf0f2f4, roughness: 0.6 }),
+      dark: new THREE.MeshStandardMaterial({ color: 0x2c3540, roughness: 0.7, metalness: 0.3 }),
+      steel: new THREE.MeshStandardMaterial({ color: 0x8b98a5, roughness: 0.35, metalness: 0.7 }),
+      glass: new THREE.MeshStandardMaterial({ color: 0x9fd6ea, roughness: 0.05, metalness: 0.3, transparent: true, opacity: 0.38 }),
+      led: new THREE.MeshBasicMaterial({ color: new THREE.Color(0x3ff5d8).multiplyScalar(2.2), toneMapped: false }),
+      ledWarm: new THREE.MeshBasicMaterial({ color: new THREE.Color(0xffc36b).multiplyScalar(1.8), toneMapped: false }),
+      wood: new THREE.MeshStandardMaterial({ color: 0xa8774b, roughness: 0.85 }),
+      grass: new THREE.MeshStandardMaterial({ color: 0x6f9a54, roughness: 1 }),
+      crate: new THREE.MeshStandardMaterial({ color: 0x55616b, roughness: 0.7, metalness: 0.2 }),
+      crateTeal: new THREE.MeshStandardMaterial({ color: 0x2c8c86, roughness: 0.6 }),
+      barrier: new THREE.MeshStandardMaterial({ color: 0xc9c9c2, roughness: 0.9 }),
+      pool: new THREE.MeshStandardMaterial({ color: 0x3fb6d6, roughness: 0.08, metalness: 0.2, transparent: true, opacity: 0.85 }),
     }
-    this.addClouds(random)
-    this.addDistantIslands(random)
-
-    // Patrol drones circle over the larger islands (never the spawn hub); the summit gets a tight guard.
-    for (const i of [1, 3, 5, 7]) {
-      const isl = ISLANDS[i]
-      this.droneRoutes.push({ center: new THREE.Vector3(isl.x, isl.top + 1.1, isl.z), radius: isl.r * 0.62, phase: random() * Math.PI * 2, dir: random() > 0.5 ? 1 : -1 })
-    }
-    const summit = ISLANDS[9]
-    this.droneRoutes.push({ center: new THREE.Vector3(summit.x, summit.top + 1.1, summit.z), radius: 1.9, phase: 0, dir: 1 })
+    this.ground()
+    this.seaAndShore()
+    this.backdrop()
+    for (const b of BUILDINGS) this.building(b)
+    this.egg()
+    this.bases()
+    this.trees()
+    this.boundary()
+    this.pointVisuals()
+    this.stationVisuals()
+    this.batchStatic()
   }
 
-  /** Per-frame ambience (clouds, shadow frustum follows the player). */
-  update(dt: number, focus: THREE.Vector3): void {
-    for (const c of this.clouds) {
-      c.position.x += dt * (c.userData.speed as number)
-      if (c.position.x > 120) c.position.x = -120
+  /** Merge every static mesh that shares a material into one draw call (≈1100 meshes → ≈150). */
+  private batchStatic(): void {
+    const dynamic = new Set<THREE.Object3D>([this.sea])
+    for (const p of this.points) dynamic.add(p.ring).add(p.disk).add(p.beam)
+    for (const s of this.stations) dynamic.add(s.ring)
+    const groups = new Map<string, { mat: THREE.Material; cast: boolean; meshes: THREE.Mesh[] }>()
+    for (const o of [...this.scene.children]) {
+      const m = o as THREE.Mesh
+      if (!m.isMesh || !m.visible || dynamic.has(m) || m.children.length || Array.isArray(m.material) || m.userData.keep) continue
+      const mat = m.material as THREE.Material
+      const key = `${mat.uuid}|${m.castShadow ? 1 : 0}`
+      let g = groups.get(key)
+      if (!g) groups.set(key, (g = { mat, cast: m.castShadow, meshes: [] }))
+      g.meshes.push(m)
     }
-    this.sun.position.set(focus.x + 18, focus.y + 34, focus.z + 12)
+    for (const g of groups.values()) {
+      if (g.meshes.length < 2) continue
+      const geos: THREE.BufferGeometry[] = []
+      for (const m of g.meshes) {
+        m.updateMatrixWorld(true)
+        let geo = m.geometry.index ? m.geometry.toNonIndexed() : m.geometry.clone()
+        for (const name of Object.keys(geo.attributes)) if (name !== 'position' && name !== 'normal' && name !== 'uv') geo.deleteAttribute(name)
+        if (!geo.attributes.uv) geo.setAttribute('uv', new THREE.Float32BufferAttribute(new Float32Array((geo.attributes.position.count) * 2), 2))
+        if (!geo.attributes.normal) geo.computeVertexNormals()
+        geo.applyMatrix4(m.matrixWorld)
+        geos.push(geo)
+      }
+      const merged = mergeGeometries(geos, false)
+      if (!merged) continue
+      for (const m of g.meshes) this.scene.remove(m)
+      const mesh = new THREE.Mesh(merged, g.mat)
+      mesh.castShadow = g.cast
+      mesh.receiveShadow = true
+      mesh.matrixAutoUpdate = false
+      this.scene.add(mesh)
+      for (const geo of geos) geo.dispose()
+    }
+  }
+
+  // ─── helpers ────────────────────────────────────────────────────────────
+  box(x: number, y0: number, z: number, w: number, h: number, d: number, mat: THREE.Material, collide = true, shadow = true): THREE.Mesh {
+    const m = new THREE.Mesh(UNIT, mat)
+    m.position.set(x, y0 + h / 2, z)
+    m.scale.set(w, h, d)
+    m.castShadow = shadow
+    m.receiveShadow = true
+    this.scene.add(m)
+    if (collide) this.col.add({ minX: x - w / 2, maxX: x + w / 2, minY: y0, maxY: y0 + h, minZ: z - d / 2, maxZ: z + d / 2 })
+    return m
+  }
+
+  private facade(tint: number, w: number, h: number, rows = 3.6): THREE.MeshStandardMaterial {
+    let pair = this.facadeCache.get(tint)
+    if (!pair) {
+      pair = facadeTextures(new THREE.Color(tint))
+      this.facadeCache.set(tint, pair)
+    }
+    const [map, emi] = pair.map(t => {
+      const c = t.clone()
+      c.repeat.set(Math.max(0.5, w / 24), Math.max(0.25, h / (rows * 12)))
+      c.needsUpdate = true
+      return c
+    })
+    return new THREE.MeshStandardMaterial({ map, emissiveMap: emi, emissive: 0xffffff, emissiveIntensity: 0.7, roughness: 0.22, metalness: 0.35, envMapIntensity: 1 })
+  }
+
+  private flatPlane(x: number, z: number, w: number, d: number, mat: THREE.Material, y = 0.01, rotY = 0): THREE.Mesh {
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(w, d), mat)
+    m.rotation.x = -Math.PI / 2
+    m.rotation.z = rotY
+    m.position.set(x, y, z)
+    m.receiveShadow = true
+    this.scene.add(m)
+    return m
+  }
+
+  // ─── ground, sea, backdrop ──────────────────────────────────────────────
+  private ground(): void {
+    const paving = groundTexture('#cdc8bc', 'rgba(120,110,95,0.28)', 256, 32)
+    paving.repeat.set(90, 60)
+    const land = this.flatPlane(0, (SHORE_Z + 420) / 2, 900, 420 - SHORE_Z, new THREE.MeshStandardMaterial({ map: paving, roughness: 0.95 }), 0)
+    land.position.z = (SHORE_Z + 420) / 2
+    const asphaltTex = groundTexture('#3c4148', 'rgba(255,255,255,0.0)', 64, 64)
+    const asphalt = new THREE.MeshStandardMaterial({ map: asphaltTex, roughness: 0.9, color: 0xffffff })
+    const dash = new THREE.MeshBasicMaterial({ color: 0xf2f2e6 })
+    for (const r of ROADS) {
+      const len = Math.hypot(r.x1 - r.x0, r.z1 - r.z0)
+      const ang = Math.atan2(r.x1 - r.x0, r.z1 - r.z0)
+      const cx = (r.x0 + r.x1) / 2, cz = (r.z0 + r.z1) / 2
+      const m = this.flatPlane(cx, cz, r.w, len, asphalt, 0.015, ang)
+      m.receiveShadow = true
+      for (let s = -len / 2 + 3; s < len / 2 - 2; s += 7) {
+        const px = cx + Math.sin(ang) * s, pz = cz + Math.cos(ang) * s
+        this.flatPlane(px, pz, 0.25, 3, dash, 0.025, ang)
+      }
+    }
+    // Lawns around the park.
+    const lawns: [number, number, number, number][] = [
+      [-62, 12, 34, 20], [62, 12, 34, 20], [-100, -12, 16, 40], [100, -12, 16, 40], [-40, 60, 20, 14], [40, 60, 20, 14],
+      [-62, 72, 30, 12], [62, 72, 30, 12], [0, -62, 40, 8],
+    ]
+    for (const [x, z, w, d] of lawns) this.flatPlane(x, z, w, d, this.mats.grass, 0.02)
+    // Egg plaza disc and reflecting pools.
+    const plaza = new THREE.Mesh(new THREE.CircleGeometry(21, 48), new THREE.MeshStandardMaterial({ color: 0xe6e0d4, roughness: 0.8 }))
+    plaza.rotation.x = -Math.PI / 2
+    plaza.position.set(EGG.x, 0.03, EGG.z)
+    plaza.receiveShadow = true
+    this.scene.add(plaza)
+    this.flatPlane(0, -24, 26, 5, this.mats.pool, 0.04)
+    this.flatPlane(0, 23, 18, 3, this.mats.pool, 0.04)
+  }
+
+  private seaAndShore(): void {
+    const geo = new THREE.PlaneGeometry(1500, 800, 90, 40)
+    geo.rotateX(-Math.PI / 2)
+    geo.translate(0, WATER_Y, SHORE_Z - 400)
+    this.seaBase = new Float32Array(geo.attributes.position.array as ArrayLike<number>)
+    this.sea = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: 0x1e5f7c, roughness: 0.18, metalness: 0.25, flatShading: true, transparent: true, opacity: 0.94 }))
+    this.sea.receiveShadow = true
+    this.scene.add(this.sea)
+    const bed = this.flatPlane(0, SHORE_Z - 200, 1500, 400, new THREE.MeshStandardMaterial({ color: 0x1b3f4f }), -3.2)
+    bed.receiveShadow = false
+    // Seawall and promenade boardwalk.
+    this.box(0, -3.2, SHORE_Z - 0.5, 900, 3.2, 1, this.mats.concrete, false, false)
+    const deck = groundTexture('#b98a5b', 'rgba(80,50,20,0.35)', 128, 16)
+    deck.repeat.set(160, 2)
+    this.flatPlane(0, SHORE_Z + 5, 900, 10, new THREE.MeshStandardMaterial({ map: deck, roughness: 0.9 }), 0.02)
+    for (let x = -126; x <= 126; x += 14) {
+      this.box(x, 0, SHORE_Z + 1.2, 0.18, 4.2, 0.18, this.mats.dark, false, false)
+      this.box(x, 4.2, SHORE_Z + 1.2, 0.5, 0.18, 0.5, this.mats.ledWarm, false, false)
+    }
+    // Piers with lit edges.
+    for (const p of PIERS) {
+      this.box(p.x, -2.4, SHORE_Z - p.len / 2, p.w, 2.4, p.len, this.mats.wood)
+      for (let z = SHORE_Z - 2; z > SHORE_Z - p.len; z -= 4) {
+        this.box(p.x - p.w / 2 + 0.3, 0, z, 0.2, 1, 0.2, this.mats.dark, false, false)
+        this.box(p.x + p.w / 2 - 0.3, 0, z, 0.2, 1, 0.2, this.mats.dark, false, false)
+      }
+      this.box(p.x, 0, SHORE_Z - p.len + 0.3, p.w, 0.12, 0.3, new THREE.MeshBasicMaterial({ color: TEAM_COLORS[p.team], toneMapped: false }), false, false)
+      const sign = labelSprite(p.team === 0 ? '红方码头' : '蓝方码头', 1.4, { color: '#fff', bg: TEAM_CSS[p.team], size: 44, pad: 12 })
+      sign.position.set(p.x, 3.2, SHORE_Z - 1)
+      this.scene.add(sign)
+    }
+    for (const b of BOAT_SPAWNS) {
+      const buoy = this.box(b.x + 6, WATER_Y - 0.4, b.z - 6, 0.8, 1.4, 0.8, new THREE.MeshStandardMaterial({ color: TEAM_COLORS[b.team] }), false, false)
+      buoy.rotation.y = 0.6
+    }
+  }
+
+  private backdrop(): void {
+    // Layered mountain ridges across the harbour (Ma On Shan / Pat Sin Leng inspired) and behind the park.
+    const ridge = (cx: number, cz: number, w: number, d: number, peak: number, seed: number, color: number) => {
+      const geo = new THREE.PlaneGeometry(w, d, 64, 10)
+      geo.rotateX(-Math.PI / 2)
+      const pos = geo.attributes.position as THREE.BufferAttribute
+      for (let i = 0; i < pos.count; i += 1) {
+        const x = pos.getX(i) / w + 0.5, z = pos.getZ(i) / d + 0.5
+        const profile = Math.sin(x * Math.PI) ** 0.8
+        const n = Math.sin(x * 9.1 + seed) * 0.22 + Math.sin(x * 23.7 + seed * 2.3) * 0.1 + Math.sin(x * 4.3 + seed * 0.7) * 0.3
+        const along = Math.sin(z * Math.PI) ** 1.3
+        pos.setY(i, Math.max(0, peak * profile * along * (0.7 + n)) - 3)
+      }
+      geo.computeVertexNormals()
+      const m = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color, roughness: 1, flatShading: true }))
+      m.position.set(cx, 0, cz)
+      this.scene.add(m)
+    }
+    ridge(-150, -560, 700, 170, 190, 1.3, 0x5d7a6c)
+    ridge(330, -600, 620, 190, 240, 4.1, 0x66827a)
+    ridge(-520, -470, 420, 160, 150, 2.2, 0x6a847c)
+    ridge(40, -360, 260, 60, 40, 7.7, 0x4f6f55)
+    ridge(-120, 330, 620, 160, 130, 5.5, 0x55735a)
+    ridge(380, 300, 420, 150, 110, 3.3, 0x5a785f)
+    // Distant skyline beyond the park fences (Pak Shek Kok / Sha Tin inspired).
+    const city = new THREE.MeshStandardMaterial({ color: 0x8aa1b4, roughness: 0.6, metalness: 0.2 })
+    for (let i = 0; i < 42; i += 1) {
+      const side = i % 3
+      const x = side === 0 ? -200 - (i * 37) % 160 : side === 1 ? 200 + (i * 53) % 160 : -180 + (i * 71) % 360
+      const z = side === 2 ? 170 + (i * 29) % 80 : -40 + (i * 43) % 220
+      const h = 20 + ((i * 97) % 70)
+      this.box(x, 0, z, 14 + (i % 4) * 4, h, 14 + (i % 3) * 5, city, false, false)
+    }
+  }
+
+  // ─── buildings ──────────────────────────────────────────────────────────
+  private building(b: BuildingDef): void {
+    switch (b.style) {
+      case 'glass': this.glassTower(b); break
+      case 'pilotis': this.pilotis(b); break
+      case 'hall': this.hall(b); break
+      case 'lab': this.lab(b); break
+      case 'pavilion': this.pavilion(b); break
+      case 'club': this.club(b); break
+      case 'rooftop': this.rooftop(b); break
+    }
+  }
+
+  private sign(b: BuildingDef, text: string, y: number, face: 'n' | 's' | 'e' | 'w', height = 1.8, color = '#eafffb'): void {
+    const m = signMesh(text, height, { color, size: 72, pad: 10, stroke: 'rgba(0,0,0,0.35)' })
+    const off = 0.08
+    if (face === 'n') m.position.set(b.x, y, b.z - b.d / 2 - off), m.rotation.y = Math.PI
+    if (face === 's') m.position.set(b.x, y, b.z + b.d / 2 + off)
+    if (face === 'e') m.position.set(b.x + b.w / 2 + off, y, b.z), m.rotation.y = Math.PI / 2
+    if (face === 'w') m.position.set(b.x - b.w / 2 - off, y, b.z), m.rotation.y = -Math.PI / 2
+    this.scene.add(m)
+  }
+
+  private ledCrown(b: BuildingDef, y: number): void {
+    this.box(b.x, y, b.z - b.d / 2 - 0.05, b.w + 0.1, 0.25, 0.1, this.mats.led, false, false)
+    this.box(b.x, y, b.z + b.d / 2 + 0.05, b.w + 0.1, 0.25, 0.1, this.mats.led, false, false)
+    this.box(b.x - b.w / 2 - 0.05, y, b.z, 0.1, 0.25, b.d + 0.1, this.mats.led, false, false)
+    this.box(b.x + b.w / 2 + 0.05, y, b.z, 0.1, 0.25, b.d + 0.1, this.mats.led, false, false)
+  }
+
+  private glassTower(b: BuildingDef): void {
+    this.box(b.x, 0, b.z, b.w, b.h, b.d, this.facade(b.tint, b.w, b.h))
+    this.box(b.x, b.h, b.z, b.w - 1.2, 1.2, b.d - 1.2, this.mats.white, false)
+    this.ledCrown(b, b.h - 0.6)
+    if (b.label) {
+      this.sign(b, b.label, b.h - 2.4, b.z > 0 ? 'n' : 's', 2.2)
+      this.sign(b, b.label, b.h - 2.4, b.x > 0 ? 'w' : 'e', 2.2)
+    }
+  }
+
+  private pilotis(b: BuildingDef): void {
+    const floor = 5.2
+    const upper = this.box(b.x, floor, b.z, b.w, b.h - floor, b.d, this.facade(b.tint, b.w, b.h - floor))
+    upper.castShadow = true
+    this.box(b.x, floor - 0.35, b.z, b.w - 0.4, 0.35, b.d - 0.4, this.mats.white, false, false)
+    // Glowing soffit panels over the open ground floor.
+    for (let i = -1; i <= 1; i += 1) this.box(b.x + i * (b.w / 3.2), floor - 0.38, b.z, 1.2, 0.05, b.d * 0.7, this.mats.led, false, false)
+    const xs = [-b.w / 2 + 0.7, -b.w / 6, b.w / 6, b.w / 2 - 0.7]
+    for (const cx of xs) for (const cz of [-b.d / 2 + 0.7, b.d / 2 - 0.7]) this.box(b.x + cx, 0, b.z + cz, 1.1, floor - 0.35, 1.1, this.mats.white)
+    for (const cx of [-b.w / 2 + 0.7, b.w / 2 - 0.7]) this.box(b.x + cx, 0, b.z, 1.1, floor - 0.35, 1.1, this.mats.white)
+    // Glass lobby core in one corner and some cover inside.
+    const core = this.box(b.x - b.w / 2 + 4.2, 0, b.z + (b.z < 0 ? -1 : 1) * (b.d / 2 - 3.4), 5, floor - 0.4, 3.6, this.mats.glass)
+    core.castShadow = false
+    this.cover(b.x, b.z, [[3.5, -2.5, 0], [-3, 3, 1], [4.5, 3.5, 2], [-5.5, -3.5, 1]])
+    this.ledCrown(b, b.h - 0.6)
+    this.box(b.x, b.h, b.z, b.w - 2, 1.4, b.d - 2, this.mats.white, false)
+    if (b.label) {
+      this.sign(b, b.label, b.h - 3, b.x < 0 ? 'e' : 'w', 3.4)
+      this.sign(b, b.label, b.h - 3, b.z < 0 ? 's' : 'n', 3.4)
+    }
+  }
+
+  private hall(b: BuildingDef): void {
+    const t = 0.6, door = 5.5
+    const wallMat = this.facade(b.tint, b.w, b.h, 2)
+    const { x, z, w, d, h } = b
+    // North/south walls (along X) and east/west walls (along Z), each with a centred door.
+    for (const sz of [-1, 1]) {
+      const zz = z + sz * (d / 2 - t / 2)
+      const seg = (w - door) / 2
+      this.box(x - door / 2 - seg / 2, 0, zz, seg, h, t, wallMat)
+      this.box(x + door / 2 + seg / 2, 0, zz, seg, h, t, wallMat)
+      this.box(x, 4.2, zz, door, h - 4.2, t, wallMat)
+      this.box(x, 4.0, zz + sz * 0.35, door + 0.6, 0.2, 0.1, this.mats.led, false, false)
+    }
+    for (const sx of [-1, 1]) {
+      const xx = x + sx * (w / 2 - t / 2)
+      const seg = (d - t * 2 - door) / 2
+      this.box(xx, 0, z - door / 2 - seg / 2, t, h, seg, wallMat)
+      this.box(xx, 0, z + door / 2 + seg / 2, t, h, seg, wallMat)
+      this.box(xx, 4.2, z, t, h - 4.2, door, wallMat)
+      this.box(xx + sx * 0.35, 4.0, z, 0.1, 0.2, door + 0.6, this.mats.led, false, false)
+    }
+    this.box(x, h, z, w, 0.6, d, this.mats.white)
+    this.box(x, h + 0.6, z, w * 0.6, 0.9, d * 0.5, this.mats.steel, false)
+    // Interior lighting.
+    for (let i = -1; i <= 1; i += 2) this.box(x + i * w / 4, h - 0.1, z, w / 3, 0.08, d * 0.6, this.mats.ledWarm, false, false)
+    const lamp = new THREE.PointLight(0xffe2b0, 60, 34, 1.4)
+    lamp.position.set(x, h - 1.5, z)
+    this.scene.add(lamp)
+    this.flatPlane(x, z, w - 1.2, d - 1.2, new THREE.MeshStandardMaterial({ color: 0x9aa6ad, roughness: 0.5, metalness: 0.2 }), 0.03)
+    if (b.id === 'rcc') {
+      // Robot cells: industrial arms on plinths, used as cover.
+      for (const [ax, az] of [[-7, -5], [7, 5], [-7, 5], [7, -5]] as const) this.robotArm(x + ax, z + az)
+      this.cover(x, z, [[0, -6.5, 0], [0, 6.5, 0], [-11, 0, 1], [11, 0, 1]])
+    } else {
+      // Exhibition booths.
+      const booth = [new THREE.MeshStandardMaterial({ color: 0x3fa9ff }), new THREE.MeshStandardMaterial({ color: 0xff9a52 }), new THREE.MeshStandardMaterial({ color: 0x5cff9d })]
+      ;[[-8, -5], [8, -5], [-8, 5], [8, 5], [0, 0]].forEach(([bx, bz], i) => {
+        this.box(x + bx, 0, z + bz, 4, 1.3, 2.2, this.mats.white)
+        this.box(x + bx, 1.3, z + bz - 0.9, 4, 2.2, 0.2, booth[i % 3], true, false)
+      })
+    }
+    if (b.label) {
+      this.sign(b, b.label, h - 1.6, 'n', 2.2)
+      this.sign(b, b.label, h - 1.6, 's', 2.2)
+      this.sign(b, b.label, h - 1.6, b.x < 0 ? 'e' : 'w', 2.2)
+    }
+  }
+
+  private robotArm(x: number, z: number): void {
+    this.box(x, 0, z, 2, 1.1, 2, this.mats.dark)
+    const orange = new THREE.MeshStandardMaterial({ color: 0xff8a2a, roughness: 0.5, metalness: 0.3 })
+    const a = this.box(x, 1.1, z, 0.7, 2.6, 0.7, orange, true)
+    a.rotation.z = 0.25
+    const f = this.box(x + 0.9, 3.4, z, 2.2, 0.5, 0.5, orange, false)
+    f.rotation.z = -0.4
+  }
+
+  /** Crates and jersey barriers around a point: [dx, dz, variant]. */
+  cover(x: number, z: number, spots: [number, number, number][]): void {
+    for (const [dx, dz, v] of spots) {
+      if (v === 0) this.box(x + dx, 0, z + dz, 3, 1.1, 0.7, this.mats.barrier)
+      else if (v === 1) {
+        this.box(x + dx, 0, z + dz, 1.4, 1.4, 1.4, this.mats.crate)
+        this.box(x + dx + 1.5, 0, z + dz + 0.2, 1.4, 1.4, 1.4, this.mats.crateTeal)
+      } else this.box(x + dx, 0, z + dz, 1.4, 2.8, 1.4, this.mats.crate)
+    }
+  }
+
+  private frontSign(b: BuildingDef): number {
+    const st = STATIONS.find(s => Math.abs(s.x - b.x) < 1 && Math.abs(s.z - b.z) < b.d + 6)
+    return st && st.z < b.z ? -1 : 1
+  }
+
+  private lab(b: BuildingDef): void {
+    const front = this.frontSign(b)
+    this.box(b.x, 0, b.z, b.w, b.h, b.d, this.facade(b.tint, b.w, b.h, 2))
+    const accent = new THREE.MeshBasicMaterial({ color: b.tint, toneMapped: false })
+    this.box(b.x, b.h - 1.2, b.z + front * (b.d / 2 + 0.06), b.w + 0.2, 0.3, 0.1, accent, false, false)
+    this.box(b.x, 3.2, b.z + front * (b.d / 2 + 1.4), 7, 0.25, 2.8, this.mats.white, false)
+    this.box(b.x - 3.3, 0, b.z + front * (b.d / 2 + 2.6), 0.25, 3.2, 0.25, this.mats.steel, false)
+    this.box(b.x + 3.3, 0, b.z + front * (b.d / 2 + 2.6), 0.25, 3.2, 0.25, this.mats.steel, false)
+    this.box(b.x, b.h, b.z, b.w - 1.5, 0.8, b.d - 1.5, this.mats.white, false)
+    if (b.label) {
+      const m = signMesh(b.label, 1.7, { color: '#ffffff', size: 72, pad: 10, stroke: 'rgba(0,0,0,0.4)' })
+      m.position.set(b.x, b.h - 2.6, b.z + front * (b.d / 2 + 0.1))
+      if (front < 0) m.rotation.y = Math.PI
+      this.scene.add(m)
+    }
+  }
+
+  private pavilion(b: BuildingDef): void {
+    const front = this.frontSign(b)
+    const walls = new THREE.MeshStandardMaterial({ color: 0xf3e2c8, roughness: 0.8 })
+    this.box(b.x, 0, b.z, b.w, b.h, b.d, walls)
+    this.box(b.x, b.h, b.z, b.w + 0.6, 0.35, b.d + 0.6, this.mats.wood, false)
+    const awning = new THREE.MeshStandardMaterial({ color: b.tint, roughness: 0.7 })
+    const aw = this.box(b.x, b.h - 1.4, b.z + front * (b.d / 2 + 1.4), b.w, 0.2, 2.8, awning, false)
+    aw.rotation.x = front * 0.18
+    this.box(b.x, 1.0, b.z + front * (b.d / 2 + 0.05), b.w * 0.7, 1.6, 0.1, this.mats.ledWarm, false, false)
+    for (let i = -1; i <= 1; i += 2) {
+      const tx = b.x + i * 4.2, tz = b.z + front * (b.d / 2 + 4.5)
+      this.box(tx, 0, tz, 1.1, 0.8, 1.1, this.mats.wood)
+      this.box(tx, 0.8, tz, 0.1, 1.6, 0.1, this.mats.dark, false, false)
+      const umb = new THREE.Mesh(new THREE.ConeGeometry(1.4, 0.6, 8), awning)
+      umb.position.set(tx, 2.6, tz)
+      umb.castShadow = true
+      this.scene.add(umb)
+    }
+    if (b.label) {
+      const m = signMesh(b.label, 1.1, { color: '#fff5e6', bg: 'rgba(120,50,10,0.85)', size: 60, pad: 12 })
+      m.position.set(b.x, b.h - 0.6, b.z + front * (b.d / 2 + 0.12))
+      if (front < 0) m.rotation.y = Math.PI
+      this.scene.add(m)
+    }
+  }
+
+  private club(b: BuildingDef): void {
+    const walls = new THREE.MeshStandardMaterial({ color: b.tint, roughness: 0.75 })
+    this.box(b.x, 0, b.z, b.w, b.h, b.d, walls)
+    this.box(b.x, b.h, b.z, b.w + 1, 0.4, b.d + 1, this.mats.wood, false)
+    this.box(b.x, 0.5, b.z - b.d / 2 - 0.06, b.w * 0.8, 3, 0.1, this.mats.glass, false, false)
+    const st = STATIONS.find(s => s.id === 'club')!
+    // Outdoor pool terrace (the heal zone).
+    this.flatPlane(st.x, st.z, 14, 6, this.mats.pool, 0.05)
+    this.box(st.x, 0, st.z - 3.3, 14.6, 0.3, 0.6, this.mats.white, true, false)
+    this.box(st.x, 0, st.z + 3.3, 14.6, 0.3, 0.6, this.mats.white, true, false)
+    for (let i = -2; i <= 2; i += 1) this.box(st.x + i * 3, 0, st.z + 5.2, 0.9, 0.45, 2, this.mats.white, false)
+    const m = signMesh('科学园会所 · 回血', 1.5, { color: '#ffffff', bg: 'rgba(20,120,80,0.9)', size: 64, pad: 12 })
+    m.position.set(b.x, b.h - 1.4, b.z - b.d / 2 - 0.1)
+    m.rotation.y = Math.PI
+    this.scene.add(m)
+  }
+
+  /** Mid-rise with an external stair, rooftop drone pad and a sky-bridge overlook toward the egg. */
+  private rooftop(b: BuildingDef): void {
+    const side = b.x < 0 ? -1 : 1
+    const { x, z, w, d, h } = b
+    this.box(x, 0, z, w, h, d, this.facade(b.tint, w, h))
+    this.ledCrown(b, h - 0.5)
+    // Stairs up the outer side, rising from the south end to the north end.
+    const steps = Math.round(h / 0.5), run = d / steps
+    const sx = x + side * (w / 2 + 1.6)
+    const stairMat = new THREE.MeshStandardMaterial({ color: 0xb9bfc4, roughness: 0.8 })
+    for (let i = 0; i < steps; i += 1) {
+      const top = (i + 1) * 0.5
+      this.box(sx, 0, z + d / 2 - (i + 0.5) * run, 3, top, run, stairMat, true, i % 4 === 0)
+    }
+    this.box(sx + side * 1.6, 0, z, 0.15, h + 1.1, d, this.mats.glass, true, false)
+    // Parapets (open toward the stair and the bridge).
+    this.box(x, h, z - d / 2 + 0.15, w, 0.9, 0.3, this.mats.white)
+    this.box(x - side * (w / 2 - 0.15), h, z, 0.3, 0.9, d, this.mats.white)
+    const gap = 3.4
+    this.box(x - (w / 4 + gap / 4), h, z + d / 2 - 0.15, w / 2 - gap / 2, 0.9, 0.3, this.mats.white)
+    this.box(x + (w / 4 + gap / 4), h, z + d / 2 - 0.15, w / 2 - gap / 2, 0.9, 0.3, this.mats.white)
+    // Sky bridge south to an overlook platform facing the Golden Egg.
+    const z0 = z + d / 2, z1 = z0 + 12, pz = z1 + 3
+    this.box(x, h - 0.4, (z0 + z1) / 2, 3.2, 0.4, z1 - z0, this.mats.steel)
+    this.box(x - 1.6, h, (z0 + z1) / 2, 0.12, 1.05, z1 - z0, this.mats.glass, true, false)
+    this.box(x + 1.6, h, (z0 + z1) / 2, 0.12, 1.05, z1 - z0, this.mats.glass, true, false)
+    this.box(x, h - 0.4, pz, 9, 0.4, 6, this.mats.steel)
+    this.box(x, h, pz + 3, 9, 1.05, 0.12, this.mats.glass, true, false)
+    this.box(x - 4.5, h, pz, 0.12, 1.05, 6, this.mats.glass, true, false)
+    this.box(x + 4.5, h, pz, 0.12, 1.05, 6, this.mats.glass, true, false)
+    this.box(x - 2.8, h - 0.4, pz - 3, 3.4, 1.0, 0.12, this.mats.glass, true, false)
+    this.box(x + 2.8, h - 0.4, pz - 3, 3.4, 1.0, 0.12, this.mats.glass, true, false)
+    this.box(x, h - 0.45, (z0 + z1) / 2, 3.3, 0.08, z1 - z0, this.mats.led, false, false)
+    for (const [cx, cz] of [[x - 3.8, pz + 2], [x + 3.8, pz + 2], [x, (z0 + z1) / 2]] as const) this.box(cx, 0, cz, 0.6, h - 0.4, 0.6, this.mats.white)
+    this.box(x - 3.5, h, pz - 1, 1.2, 1.1, 0.6, this.mats.crate)
+    this.box(x + 3.5, h, pz - 1, 1.2, 1.1, 0.6, this.mats.crate)
+    if (b.label) this.sign(b, b.label, h - 2, side < 0 ? 'e' : 'w', 2)
+    const bridgeSign = signMesh('连桥 · 金蛋观测台', 0.8, { color: '#eafffb', bg: 'rgba(10,40,50,0.85)', size: 48, pad: 10 })
+    bridgeSign.position.set(x, h + 1.7, z0 + 0.4)
+    this.scene.add(bridgeSign)
+    // Drone pad.
+    const pad = DRONE_PADS.find(p => Math.abs(p.x - x) < 1)!
+    const disc = new THREE.Mesh(new THREE.CircleGeometry(pad.r + 0.4, 32), new THREE.MeshBasicMaterial({ map: helipadTexture('#7ef9ff', 'UAV'), toneMapped: false }))
+    disc.rotation.x = -Math.PI / 2
+    disc.position.set(pad.x, pad.y + 0.03, pad.z)
+    this.scene.add(disc)
+    const icon = new THREE.Sprite(new THREE.SpriteMaterial({ map: badgeTexture('无人机', '#7ef9ff'), depthTest: true, toneMapped: false }))
+    icon.scale.set(1.6, 1.6, 1)
+    icon.position.set(pad.x, pad.y + 3.4, pad.z)
+    this.scene.add(icon)
+    this.padIcons.push(icon)
+    const stairSign = labelSprite('↑ 屋顶无人机坪', 0.7, { color: '#7ef9ff', bg: 'rgba(5,20,30,0.85)', size: 44, pad: 10 })
+    stairSign.position.set(sx, 2.4, z + d / 2 + 1)
+    this.scene.add(stairSign)
+  }
+
+  // ─── the Golden Egg ─────────────────────────────────────────────────────
+  private egg(): void {
+    const gold = new THREE.MeshStandardMaterial({ map: eggTexture(), metalness: 0.85, roughness: 0.28, envMapIntensity: 1.5, emissive: 0x3a2400, emissiveIntensity: 0.25 })
+    const shell = new THREE.Mesh(new THREE.SphereGeometry(1, 56, 28), gold)
+    shell.scale.set(EGG.rx, EGG.ry, EGG.rz)
+    shell.position.set(EGG.x, EGG.cy, EGG.z)
+    shell.castShadow = true
+    this.scene.add(shell)
+    this.col.add({ minX: EGG.x - EGG.rx * 0.92, maxX: EGG.x + EGG.rx * 0.92, minY: EGG.cy - EGG.ry * 0.85, maxY: EGG.cy + EGG.ry * 0.9, minZ: EGG.z - EGG.rz * 0.8, maxZ: EGG.z + EGG.rz * 0.8 })
+    const legMat = new THREE.MeshStandardMaterial({ color: 0xf4f5f6, roughness: 0.4, metalness: 0.2 })
+    const legGeo = new THREE.CylinderGeometry(0.55, 0.65, EGG.cy - 3, 12)
+    for (let i = 0; i < 10; i += 1) {
+      const a = (i / 10) * Math.PI * 2 + 0.3
+      const lx = EGG.x + Math.cos(a) * EGG.rx * 0.52, lz = EGG.z + Math.sin(a) * EGG.rz * 0.5
+      const leg = new THREE.Mesh(legGeo, legMat)
+      leg.position.set(lx, (EGG.cy - 3) / 2, lz)
+      leg.castShadow = true
+      leg.receiveShadow = true
+      this.scene.add(leg)
+      this.col.add({ minX: lx - 0.6, maxX: lx + 0.6, minY: 0, maxY: EGG.cy - 3, minZ: lz - 0.6, maxZ: lz + 0.6 })
+    }
+    // Glowing ring under the shell and the entrance stair tower on its north side.
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(1, 0.012, 6, 64), new THREE.MeshBasicMaterial({ color: 0xffd35c, toneMapped: false }))
+    ring.scale.set(EGG.rx * 0.93, EGG.rz * 0.93, 30)
+    ring.rotation.x = Math.PI / 2
+    ring.position.set(EGG.x, EGG.cy - EGG.ry * 0.38, EGG.z)
+    this.scene.add(ring)
+    const glassTube = this.box(EGG.x, 0, EGG.z - EGG.rz - 1.2, 3.2, EGG.cy - 5, 3.2, this.mats.glass)
+    glassTube.castShadow = false
+    this.cover(EGG.x, EGG.z, [[-9, 5, 0], [9, -5, 0], [-4.5, -9.5, 1], [3, 9.5, 1], [-11, -2, 2], [11, 2, 2]])
+    const title = labelSprite('金蛋 · 高锟会议中心', 2.2, { color: '#ffe7a3', stroke: 'rgba(40,20,0,0.8)', size: 64, pad: 12 })
+    title.position.set(EGG.x, EGG.cy + EGG.ry + 3.2, EGG.z)
+    this.scene.add(title)
+  }
+
+  // ─── team bases ─────────────────────────────────────────────────────────
+  private bases(): void {
+    for (const base of BASES) {
+      const s = base.team === 0 ? -1 : 1
+      const color = TEAM_COLORS[base.team]
+      const teamMat = new THREE.MeshStandardMaterial({ color, roughness: 0.6, emissive: color, emissiveIntensity: 0.15 })
+      const glow = new THREE.MeshBasicMaterial({ color, toneMapped: false, transparent: true, opacity: 0.5 })
+      const disc = new THREE.Mesh(new THREE.CircleGeometry(base.r, 40), glow)
+      disc.rotation.x = -Math.PI / 2
+      disc.position.set(base.x, 0.04, base.z)
+      this.scene.add(disc)
+      ;(disc.material as THREE.MeshBasicMaterial).opacity = 0.22
+      // Defensive walls with a gap toward the park.
+      this.box(base.x + s * 8, 0, base.z - 9, 10, 2.4, 0.8, this.mats.barrier)
+      this.box(base.x + s * 8, 0, base.z + 9, 10, 2.4, 0.8, this.mats.barrier)
+      this.box(base.x - s * 4, 0, base.z - 12, 0.8, 2.4, 6, this.mats.barrier)
+      this.box(base.x - s * 4, 0, base.z + 12, 0.8, 2.4, 6, this.mats.barrier)
+      this.box(base.x + s * 6, 0, base.z, 1.4, 1.4, 4, this.mats.crate)
+      for (const dz of [-9, 9]) {
+        this.box(base.x + s * 13, 0, base.z + dz, 0.2, 7, 0.2, this.mats.dark, false)
+        this.box(base.x + s * 13 - s * 1.1, 4.4, base.z + dz, 2.2, 2.4, 0.08, teamMat, false)
+      }
+      const label = labelSprite(base.team === 0 ? '红方部署区' : '蓝方部署区', 1.6, { color: '#fff', bg: TEAM_CSS[base.team], size: 48, pad: 14 })
+      label.position.set(base.x, 5, base.z)
+      this.scene.add(label)
+      // Helipad.
+      const hp = HELIPADS[base.team]
+      const pad = new THREE.Mesh(new THREE.CircleGeometry(hp.r + 1.5, 40), new THREE.MeshStandardMaterial({ map: helipadTexture(TEAM_CSS[base.team], 'H'), roughness: 0.7 }))
+      pad.rotation.x = -Math.PI / 2
+      pad.position.set(hp.x, 0.05, hp.z)
+      pad.receiveShadow = true
+      this.scene.add(pad)
+      for (let i = 0; i < 8; i += 1) {
+        const a = (i / 8) * Math.PI * 2
+        this.box(hp.x + Math.cos(a) * (hp.r + 1.9), 0, hp.z + Math.sin(a) * (hp.r + 1.9), 0.3, 0.25, 0.3, this.mats.ledWarm, false, false)
+      }
+      const icon = new THREE.Sprite(new THREE.SpriteMaterial({ map: badgeTexture('直升机', TEAM_CSS[base.team]), toneMapped: false }))
+      icon.scale.set(1.8, 1.8, 1)
+      icon.position.set(hp.x - s * (hp.r + 3), 3, hp.z)
+      this.scene.add(icon)
+      this.padIcons.push(icon)
+    }
+  }
+
+  // ─── vegetation and bounds ──────────────────────────────────────────────
+  private trees(): void {
+    const spots: [number, number][] = []
+    const blocked = (x: number, z: number) =>
+      BUILDINGS.some(b => Math.abs(x - b.x) < b.w / 2 + 3 && Math.abs(z - b.z) < b.d / 2 + 5) ||
+      POINTS.some(p => Math.hypot(x - p.x, z - p.z) < p.r + 3) ||
+      STATIONS.some(s => Math.hypot(x - s.x, z - s.z) < s.r + 3) ||
+      BASES.some(b => Math.hypot(x - b.x, z - b.z) < 16) ||
+      HELIPADS.some(h => Math.hypot(x - h.x, z - h.z) < 11) ||
+      Math.hypot(x, z) < 24
+    for (const r of ROADS) {
+      const len = Math.hypot(r.x1 - r.x0, r.z1 - r.z0)
+      const ux = (r.x1 - r.x0) / len, uz = (r.z1 - r.z0) / len
+      for (let s = 4; s < len - 4; s += 11) for (const side of [-1, 1]) {
+        const x = r.x0 + ux * s - uz * side * (r.w / 2 + 1.8)
+        const z = r.z0 + uz * s + ux * side * (r.w / 2 + 1.8)
+        if (x < LAND.minX + 3 || x > LAND.maxX - 3 || z < SHORE_Z + 11 || z > LAND.maxZ - 2) continue
+        if (!blocked(x, z) && !ROADS.some(o => o !== r && onRoad(o, x, z))) spots.push([x, z])
+      }
+    }
+    for (let x = -120; x <= 120; x += 12) if (!blocked(x, SHORE_Z + 12)) spots.push([x, SHORE_Z + 12])
+    const trunk = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.18, 0.26, 2.6, 6), new THREE.MeshStandardMaterial({ color: 0x6b4a32 }), spots.length)
+    const crown = new THREE.InstancedMesh(new THREE.IcosahedronGeometry(1.9, 0), new THREE.MeshStandardMaterial({ color: 0xffffff, flatShading: true, roughness: 0.9 }), spots.length)
+    const m = new THREE.Matrix4(), q = new THREE.Quaternion(), c = new THREE.Color()
+    spots.forEach(([x, z], i) => {
+      const s = 0.85 + ((i * 37) % 10) / 20
+      m.compose(new THREE.Vector3(x, 1.3, z), q, new THREE.Vector3(1, 1, 1))
+      trunk.setMatrixAt(i, m)
+      m.compose(new THREE.Vector3(x, 3.4 * s, z), q.setFromEuler(new THREE.Euler(0, i, 0)), new THREE.Vector3(s, s * 1.1, s))
+      crown.setMatrixAt(i, m)
+      crown.setColorAt(i, c.setHSL(0.26 + ((i * 13) % 10) / 120, 0.45, 0.32 + ((i * 7) % 10) / 80))
+      this.col.add({ minX: x - 0.3, maxX: x + 0.3, minY: 0, maxY: 2.6, minZ: z - 0.3, maxZ: z + 0.3 })
+    })
+    q.identity()
+    trunk.castShadow = crown.castShadow = true
+    crown.receiveShadow = true
+    this.scene.add(trunk, crown)
+  }
+
+  private boundary(): void {
+    const fence = new THREE.MeshStandardMaterial({ color: 0x3a444e, roughness: 0.6, metalness: 0.4 })
+    const hedge = new THREE.MeshStandardMaterial({ color: 0x4f7a43, roughness: 1 })
+    this.box(LAND.minX - 0.5, 0, (SHORE_Z + LAND.maxZ) / 2, 1, 40, LAND.maxZ - SHORE_Z, fence, true, false).visible = false
+    this.box(LAND.maxX + 0.5, 0, (SHORE_Z + LAND.maxZ) / 2, 1, 40, LAND.maxZ - SHORE_Z, fence, true, false).visible = false
+    this.box(0, 0, LAND.maxZ + 0.5, LAND.maxX * 2 + 2, 40, 1, fence, true, false).visible = false
+    this.box(LAND.minX - 1, 0, (SHORE_Z + LAND.maxZ) / 2, 1.6, 1.4, LAND.maxZ - SHORE_Z, hedge, false, false)
+    this.box(LAND.maxX + 1, 0, (SHORE_Z + LAND.maxZ) / 2, 1.6, 1.4, LAND.maxZ - SHORE_Z, hedge, false, false)
+    this.box(0, 0, LAND.maxZ + 1, LAND.maxX * 2 + 4, 1.4, 1.6, hedge, false, false)
+  }
+
+  // ─── dynamic markers ────────────────────────────────────────────────────
+  private pointVisuals(): void {
+    for (const p of POINTS) {
+      const ring = new THREE.Mesh(new THREE.RingGeometry(p.r - 0.35, p.r, 64), new THREE.MeshBasicMaterial({ color: NEUTRAL, toneMapped: false, transparent: true, opacity: 0.9, side: THREE.DoubleSide }))
+      ring.rotation.x = -Math.PI / 2
+      ring.position.set(p.x, 0.06, p.z)
+      const disk = new THREE.Mesh(new THREE.CircleGeometry(p.r - 0.35, 64), new THREE.MeshBasicMaterial({ color: NEUTRAL, transparent: true, opacity: 0.08, depthWrite: false }))
+      disk.rotation.x = -Math.PI / 2
+      disk.position.set(p.x, 0.05, p.z)
+      const beam = new THREE.Mesh(new THREE.CylinderGeometry(p.r, p.r, 2.4, 48, 1, true), new THREE.MeshBasicMaterial({ color: NEUTRAL, transparent: true, opacity: 0.1, side: THREE.DoubleSide, depthWrite: false, toneMapped: false }))
+      beam.position.set(p.x, 1.2, p.z)
+      const badgeTex = [badgeTexture(p.short, '#e8edf2'), badgeTexture(p.short, TEAM_CSS[0]), badgeTexture(p.short, TEAM_CSS[1])]
+      const badge = new THREE.Sprite(new THREE.SpriteMaterial({ map: badgeTex[0], toneMapped: false }))
+      const b = BUILDINGS.find(bb => bb.id === p.id)
+      const y = p.kind === 'egg' ? EGG.cy + EGG.ry + 6.5 : b && b.style === 'hall' ? b.h + 3.5 : 3.6
+      badge.position.set(p.x, y, p.z)
+      badge.scale.setScalar(p.kind === 'egg' ? 3.6 : 2.2)
+      this.scene.add(ring, disk, beam, badge)
+      this.points.push({ ring, disk, beam, badge, badgeTex })
+    }
+  }
+
+  private stationVisuals(): void {
+    for (const s of STATIONS) {
+      const color = s.kind === 'supply' ? '#ffa94d' : s.kind === 'heal' ? '#5cff9d' : SKILLS[s.skill!].color
+      const glyph = s.kind === 'supply' ? '补给' : s.kind === 'heal' ? '回血' : '技能'
+      const ring = new THREE.Mesh(new THREE.RingGeometry(s.r - 0.25, s.r, 48), new THREE.MeshBasicMaterial({ color, toneMapped: false, transparent: true, opacity: 0.85, side: THREE.DoubleSide }))
+      ring.rotation.x = -Math.PI / 2
+      ring.position.set(s.x, 0.07, s.z)
+      const icon = new THREE.Sprite(new THREE.SpriteMaterial({ map: badgeTexture(glyph, color), toneMapped: false, transparent: true }))
+      icon.scale.setScalar(1.5)
+      const baseY = s.kind === 'heal' ? 3.2 : 2.6
+      icon.position.set(s.x, baseY, s.z)
+      this.scene.add(ring, icon)
+      this.stations.push({ def: s, ring, icon, baseY })
+    }
+  }
+
+  setPointOwner(i: number, owner: number, capturing: number, contested: boolean, t: number): void {
+    const v = this.points[i]
+    const col = owner >= 0 ? TEAM_COLORS[owner] : NEUTRAL
+    const pulse = capturing >= 0 && capturing !== owner ? 0.5 + 0.5 * Math.sin(t * 8) : 1
+    const shown = contested ? (Math.sin(t * 10) > 0 ? 0xffd35c : col) : capturing >= 0 && capturing !== owner && pulse > 0.5 ? TEAM_COLORS[capturing] : col
+    ;(v.ring.material as THREE.MeshBasicMaterial).color.setHex(shown)
+    ;(v.disk.material as THREE.MeshBasicMaterial).color.setHex(col)
+    ;(v.beam.material as THREE.MeshBasicMaterial).color.setHex(shown)
+    ;(v.beam.material as THREE.MeshBasicMaterial).opacity = 0.07 + 0.06 * pulse
+    const sm = v.badge.material as THREE.SpriteMaterial
+    const tex = v.badgeTex[owner + 1]
+    if (sm.map !== tex) {
+      sm.map = tex
+      sm.needsUpdate = true
+    }
+  }
+
+  setStationReady(i: number, ready: boolean): void {
+    const m = this.stations[i].icon.material as THREE.SpriteMaterial
+    m.opacity = ready ? 1 : 0.28
+  }
+
+  /** Per-frame ambient animation and sun/shadow follow. */
+  animate(t: number, focus: THREE.Vector3): void {
+    const pos = this.sea.geometry.attributes.position as THREE.BufferAttribute
+    const arr = pos.array as Float32Array
+    for (let i = 0; i < arr.length; i += 3) {
+      const x = this.seaBase[i], z = this.seaBase[i + 2]
+      arr[i + 1] = WATER_Y + Math.sin(x * 0.045 + t * 1.1) * 0.22 + Math.cos(z * 0.06 + t * 1.4 + x * 0.01) * 0.18
+    }
+    pos.needsUpdate = true
+    for (const s of this.stations) s.icon.position.y = s.baseY + Math.sin(t * 2 + s.def.x) * 0.18
+    for (const icon of this.padIcons) icon.position.y += Math.sin(t * 2.2) * 0.004
+    this.sun.position.set(focus.x - 120, focus.y + 150, focus.z - 70)
     this.sun.target.position.copy(focus)
   }
-
-  /** Advance moving platforms by one fixed step and record their movement. */
-  stepMovers(elapsed: number): void {
-    for (const m of this.movers) {
-      // Ease in-out ping-pong with a pause at each end so boarding is forgiving.
-      const t = ((elapsed + m.phase) % m.period) / m.period
-      const tri = t < 0.5 ? t * 2 : 2 - t * 2
-      const k = THREE.MathUtils.smootherstep(THREE.MathUtils.clamp((tri - 0.12) / 0.76, 0, 1), 0, 1)
-      const target = new THREE.Vector3().lerpVectors(m.from, m.to, k)
-      const cur = m.body.translation()
-      m.delta.set(target.x - cur.x, target.y - cur.y, target.z - cur.z)
-      m.body.setNextKinematicTranslation(target)
-    }
-  }
-
-  private makeSky(): THREE.Mesh {
-    const mat = new THREE.ShaderMaterial({
-      side: THREE.BackSide,
-      depthWrite: false,
-      fog: false,
-      uniforms: {
-        top: { value: PALETTE.skyTop },
-        horizon: { value: PALETTE.horizon },
-        sunDir: { value: new THREE.Vector3(18, 34, 12).normalize() },
-      },
-      vertexShader: /* glsl */ `
-        varying vec3 vDir;
-        void main() {
-          vDir = normalize(position);
-          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-        }`,
-      fragmentShader: /* glsl */ `
-        uniform vec3 top; uniform vec3 horizon; uniform vec3 sunDir;
-        varying vec3 vDir;
-        void main() {
-          float h = clamp(vDir.y, -1.0, 1.0);
-          vec3 col = mix(horizon, top, pow(max(h, 0.0), 0.55));
-          col = mix(col, horizon * 0.92, smoothstep(0.0, -0.4, h));
-          float s = max(dot(normalize(vDir), sunDir), 0.0);
-          col += vec3(1.0, 0.85, 0.6) * (pow(s, 600.0) * 3.0 + pow(s, 12.0) * 0.25);
-          gl_FragColor = vec4(col, 1.0);
-          #include <colorspace_fragment>
-        }`,
-    })
-    const sky = new THREE.Mesh(new THREE.SphereGeometry(400, 32, 16), mat)
-    sky.renderOrder = -1
-    return sky
-  }
-
-  private addIsland(isl: Island, index: number, random: () => number): void {
-    const group = new THREE.Group()
-    group.position.set(isl.x, isl.top, isl.z)
-
-    const topGeo = new THREE.CylinderGeometry(isl.r, isl.r * 0.94, 0.8, 22, 1)
-    const top = new THREE.Mesh(topGeo, flat(PALETTE.grass))
-    top.position.y = -0.4
-    top.receiveShadow = true
-    top.castShadow = true
-    group.add(top)
-
-    const rim = new THREE.Mesh(new THREE.CylinderGeometry(isl.r * 0.94, isl.r * 0.86, 0.6, 22, 1), flat(PALETTE.grassDark))
-    rim.position.y = -1.1
-    group.add(rim)
-
-    const under = new THREE.ConeGeometry(isl.r * 0.88, isl.r * 1.7 + 1.5, 14, 4)
-    jitter(under, random, 0.28 * isl.r * 0.35)
-    const rock = new THREE.Mesh(under, flat(PALETTE.rock))
-    rock.rotation.x = Math.PI
-    rock.position.y = -1.4 - (isl.r * 1.7 + 1.5) / 2
-    rock.castShadow = true
-    group.add(rock)
-    this.scene.add(group)
-
-    this.physics.addStaticCylinder(new THREE.Vector3(isl.x, isl.top - 0.4, isl.z), isl.r, 0.8)
-
-    // Core spots: spread around the island, away from the centre where the player lands.
-    for (let c = 0; c < isl.cores; c += 1) {
-      const angle = (c / isl.cores) * Math.PI * 2 + index * 1.3
-      const dist = isl.cores === 1 ? 0 : isl.r * 0.55
-      this.coreSpots.push(new THREE.Vector3(isl.x + Math.cos(angle) * dist, isl.top + 1.1, isl.z + Math.sin(angle) * dist))
-    }
-
-    if (isl.decor) {
-      const trees = Math.round(isl.r * 0.6)
-      for (let t = 0; t < trees; t += 1) {
-        const angle = random() * Math.PI * 2
-        const dist = isl.r * (0.68 + random() * 0.2)
-        this.addTree(isl.x + Math.cos(angle) * dist, isl.top, isl.z + Math.sin(angle) * dist, 0.6 + random() * 0.4, random)
-      }
-    }
-    for (let k = 0; k < 3; k += 1) {
-      const angle = random() * Math.PI * 2
-      const dist = isl.r * (0.8 + random() * 0.12)
-      const crystal = new THREE.Mesh(new THREE.OctahedronGeometry(0.22 + random() * 0.18, 0), glow(PALETTE.crystal, 2.4))
-      crystal.scale.y = 2.2
-      crystal.position.set(isl.x + Math.cos(angle) * dist, isl.top + 0.3, isl.z + Math.sin(angle) * dist)
-      crystal.rotation.set(random() * 0.4, random() * 3, random() * 0.4)
-      this.scene.add(crystal)
-    }
-  }
-
-  private addTree(x: number, y: number, z: number, scale: number, random: () => number): void {
-    const tree = new THREE.Group()
-    tree.position.set(x, y, z)
-    tree.scale.setScalar(scale)
-    const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.2, 1.1, 6), flat(PALETTE.trunk))
-    trunk.position.y = 0.55
-    trunk.castShadow = true
-    tree.add(trunk)
-    const leafColor = PALETTE.leaf[Math.floor(random() * PALETTE.leaf.length)]
-    for (let i = 0; i < 2; i += 1) {
-      const leaves = new THREE.Mesh(new THREE.IcosahedronGeometry(0.75 - i * 0.2, 0), flat(leafColor))
-      leaves.position.set((random() - 0.5) * 0.2, 1.35 + i * 0.6, (random() - 0.5) * 0.2)
-      leaves.rotation.set(random(), random(), random())
-      leaves.castShadow = true
-      tree.add(leaves)
-    }
-    this.scene.add(tree)
-    this.physics.addStaticCylinder(new THREE.Vector3(x, y + 1.2 * scale, z), 0.28 * scale, 2.4 * scale)
-  }
-
-  private addStones(a: Island, b: Island, random: () => number): void {
-    const stones = planStones(a, b)
-    stones.forEach((s, i) => {
-      const mesh = new THREE.Mesh(new THREE.BoxGeometry(STONE, 0.55, STONE), flat(PALETTE.stone))
-      const rot = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), random() * Math.PI)
-      mesh.position.set(s.x, s.top - 0.275, s.z)
-      mesh.quaternion.copy(rot)
-      mesh.castShadow = true
-      mesh.receiveShadow = true
-      const underside = new THREE.Mesh(new THREE.ConeGeometry(STONE * 0.62, 1.4, 5), flat(PALETTE.rockDark))
-      underside.rotation.x = Math.PI
-      underside.position.y = -0.95
-      mesh.add(underside)
-      this.scene.add(mesh)
-      this.physics.addStaticBox(mesh.position, new THREE.Vector3(STONE, 0.55, STONE), rot)
-      // Every other stone carries a core to pull the player along the route.
-      if (i % 2 === 1) this.coreSpots.push(new THREE.Vector3(s.x, s.top + 1.1, s.z))
-    })
-  }
-
-  private addMover(a: Island, b: Island, seed: number): void {
-    const dir = new THREE.Vector3(b.x - a.x, 0, b.z - a.z).normalize()
-    const half = new THREE.Vector3(1.3, 0.25, 1.3)
-    const from = new THREE.Vector3(a.x, a.top - half.y, a.z).addScaledVector(dir, a.r + half.x + 0.25)
-    const to = new THREE.Vector3(b.x, b.top - half.y, b.z).addScaledVector(dir, -(b.r + half.x + 0.25))
-    const mesh = new THREE.Mesh(new THREE.BoxGeometry(half.x * 2, half.y * 2, half.z * 2), flat(new THREE.Color('#f2b84b')))
-    mesh.castShadow = true
-    mesh.receiveShadow = true
-    const stripe = new THREE.Mesh(new THREE.BoxGeometry(half.x * 2 + 0.02, 0.1, 0.35), glow(new THREE.Color('#ffefb0'), 3))
-    stripe.position.y = half.y - 0.02
-    mesh.add(stripe)
-    mesh.position.copy(from)
-    this.scene.add(mesh)
-    const body = this.physics.addKinematic(mesh, RAPIER.ColliderDesc.cuboid(half.x, half.y, half.z).setFriction(1))
-    const period = Math.max(6, from.distanceTo(to) * 0.9)
-    this.movers.push({ mesh, body, from, to, period, phase: (seed % 5) * 0.7, delta: new THREE.Vector3(), half })
-  }
-
-  private addClouds(random: () => number): void {
-    // Unlit with baked top-to-bottom shading: soft and bright without tripping the bloom threshold.
-    const mat = new THREE.MeshBasicMaterial({ vertexColors: true })
-    for (let i = 0; i < 26; i += 1) {
-      const cloud = new THREE.Group()
-      const puffs = 3 + Math.floor(random() * 4)
-      for (let p = 0; p < puffs; p += 1) {
-        const puff = new THREE.Mesh(shadeCloud(new THREE.IcosahedronGeometry(1.4 + random() * 1.6, 1)), mat)
-        puff.position.set(p * 1.6 - puffs * 0.8, random() * 0.8, (random() - 0.5) * 1.6)
-        puff.scale.y = 0.62
-        cloud.add(puff)
-      }
-      const low = random() < 0.6
-      cloud.position.set((random() - 0.5) * 240, low ? -14 - random() * 12 : 18 + random() * 16, (random() - 0.5) * 200)
-      cloud.scale.setScalar(low ? 2.4 + random() * 2 : 1.2 + random())
-      cloud.userData.speed = 0.6 + random() * 0.8
-      this.clouds.push(cloud)
-      this.scene.add(cloud)
-    }
-  }
-
-  private addDistantIslands(random: () => number): void {
-    for (let i = 0; i < 9; i += 1) {
-      const angle = (i / 9) * Math.PI * 2 + random() * 0.4
-      const dist = 75 + random() * 35
-      const r = 5 + random() * 7
-      const g = new THREE.Group()
-      const top = new THREE.Mesh(new THREE.CylinderGeometry(r, r * 0.9, 1.2, 12), flat(PALETTE.grassDark))
-      const under = new THREE.ConeGeometry(r * 0.85, r * 2.2, 9, 2)
-      jitter(under, random, r * 0.12)
-      const rock = new THREE.Mesh(under, flat(PALETTE.rockDark))
-      rock.rotation.x = Math.PI
-      rock.position.y = -r * 1.1 - 0.6
-      g.add(top, rock)
-      g.position.set(Math.cos(angle) * dist, -6 + random() * 22, Math.sin(angle) * dist)
-      this.scene.add(g)
-    }
-  }
 }
 
-const materialCache = new Map<string, THREE.Material>()
-function flat(color: THREE.Color): THREE.MeshStandardMaterial {
-  const key = `flat:${color.getHexString()}`
-  let m = materialCache.get(key) as THREE.MeshStandardMaterial | undefined
-  if (!m) {
-    m = new THREE.MeshStandardMaterial({ color, flatShading: true, roughness: 0.92, metalness: 0 })
-    materialCache.set(key, m)
-  }
-  return m
-}
-
-export function glow(color: THREE.Color, intensity: number): THREE.MeshStandardMaterial {
-  return new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: intensity, flatShading: true, roughness: 0.3 })
-}
-
-function shadeCloud(geo: THREE.BufferGeometry): THREE.BufferGeometry {
-  const pos = geo.attributes.position
-  geo.computeBoundingBox()
-  const { min, max } = geo.boundingBox!
-  const colors = new Float32Array(pos.count * 3)
-  const top = new THREE.Color('#ffffff')
-  const bottom = new THREE.Color('#c9cfe6')
-  const c = new THREE.Color()
-  for (let i = 0; i < pos.count; i += 1) {
-    c.lerpColors(bottom, top, (pos.getY(i) - min.y) / (max.y - min.y))
-    colors.set([c.r, c.g, c.b], i * 3)
-  }
-  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3))
-  return geo
-}
-
-/** Displace vertices so primitives read as hand-carved rock, keeping shared seams closed. */
-function jitter(geo: THREE.BufferGeometry, random: () => number, amount: number): void {
-  const pos = geo.attributes.position as THREE.BufferAttribute
-  const offsets = new Map<string, THREE.Vector3>()
-  const v = new THREE.Vector3()
-  for (let i = 0; i < pos.count; i += 1) {
-    v.fromBufferAttribute(pos, i)
-    const key = `${v.x.toFixed(3)},${v.y.toFixed(3)},${v.z.toFixed(3)}`
-    let o = offsets.get(key)
-    if (!o) {
-      o = new THREE.Vector3((random() - 0.5) * amount, (random() - 0.5) * amount, (random() - 0.5) * amount)
-      offsets.set(key, o)
-    }
-    pos.setXYZ(i, v.x + o.x, v.y + o.y, v.z + o.z)
-  }
-  geo.computeVertexNormals()
+function onRoad(r: { x0: number; z0: number; x1: number; z1: number; w: number }, x: number, z: number): boolean {
+  const dx = r.x1 - r.x0, dz = r.z1 - r.z0
+  const len2 = dx * dx + dz * dz
+  const t = Math.max(0, Math.min(1, ((x - r.x0) * dx + (z - r.z0) * dz) / len2))
+  return Math.hypot(x - (r.x0 + dx * t), z - (r.z0 + dz * t)) < r.w / 2 + 1
 }

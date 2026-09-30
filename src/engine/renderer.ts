@@ -38,7 +38,7 @@ export class Renderer {
     this.gl.outputColorSpace = THREE.SRGBColorSpace
     this.gl.toneMapping = THREE.ACESFilmicToneMapping
     this.gl.toneMappingExposure = 1
-    this.gl.shadowMap.type = THREE.PCFSoftShadowMap
+    this.gl.shadowMap.type = THREE.PCFShadowMap
     this.applyQuality(quality)
     window.addEventListener('resize', () => this.resize())
   }
@@ -66,7 +66,7 @@ export class Renderer {
     const size = this.gl.getSize(new THREE.Vector2())
     this.composer = new EffectComposer(this.gl)
     this.composer.addPass(new RenderPass(scene, camera))
-    this.bloom = new UnrealBloomPass(size, 0.45, 0.3, 1.6)
+    this.bloom = new UnrealBloomPass(size, 0.4, 0.35, 1.05)
     this.composer.addPass(this.bloom)
     this.composer.addPass(new OutputPass())
     this.composer.setSize(size.x, size.y)

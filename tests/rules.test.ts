@@ -1,73 +1,90 @@
 import { describe, expect, it } from 'vitest'
 import { CONFIG } from '../src/game/config'
-import { collect, createRun, damage, formatClock, stars, tick } from '../src/game/rules'
+import { addKill, createMatch, eggIndex, formatClock, leader, stepPoint, tickMatch } from '../src/game/rules'
 
-describe('run rules', () => {
-  it('scores cores with a combo multiplier that resets after the window', () => {
-    let s = createRun(10)
-    let r = collect(s)
-    expect(r.points).toBe(CONFIG.score.core)
-    s = collect(r.state).state
-    expect(s.combo).toBe(2)
-    expect(s.score).toBe(CONFIG.score.core * 3)
-    s = tick(s, CONFIG.score.comboWindow + 0.01)
-    expect(s.combo).toBe(0)
-    r = collect(s)
-    expect(r.points).toBe(CONFIG.score.core)
+const kinds = ['building', 'egg', 'building'] as const
+const run = (fn: () => void, seconds: number, dt = 0.1) => {
+  for (let t = 0; t < seconds; t += dt) fn()
+}
+
+describe('capture', () => {
+  it('captures a neutral point with a single team and reports it', () => {
+    const s = createMatch([...kinds])
+    let captured = false
+    run(() => {
+      const e = stepPoint(s, 0, [1, 0], 0.1)
+      if (e?.type === 'captured') captured = true
+    }, 1 / CONFIG.capture.rate + 0.5)
+    expect(captured).toBe(true)
+    expect(s.points[0].owner).toBe(0)
   })
-
-  it('caps the combo', () => {
-    let s = createRun(20)
-    for (let i = 0; i < 10; i += 1) s = collect(s).state
-    expect(s.combo).toBe(CONFIG.score.comboMax)
+  it('pauses while contested and lets more units capture faster', () => {
+    const a = createMatch([...kinds])
+    stepPoint(a, 0, [1, 1], 1)
+    expect(a.points[0].contested).toBe(true)
+    expect(a.points[0].progress).toBe(0)
+    const b = createMatch([...kinds])
+    stepPoint(b, 0, [3, 0], 1)
+    const c = createMatch([...kinds])
+    stepPoint(c, 0, [1, 0], 1)
+    expect(b.points[0].progress).toBeGreaterThan(c.points[0].progress)
   })
-
-  it('wins on the last core and adds time and life bonuses', () => {
-    let s = createRun(1)
-    s = tick(s, 10)
-    s = collect(s).state
-    expect(s.phase).toBe('won')
-    expect(s.timeBonus).toBe(Math.ceil(CONFIG.run.seconds - 10) * CONFIG.score.timeBonus)
-    expect(s.lifeBonus).toBe(CONFIG.run.lives * CONFIG.score.lifeBonus)
-    expect(s.score).toBe(CONFIG.score.core + s.timeBonus + s.lifeBonus)
+  it('must neutralize an owned point before taking it', () => {
+    const s = createMatch([...kinds])
+    s.points[0].owner = 1
+    s.points[0].progress = 1
+    const events: string[] = []
+    run(() => {
+      const e = stepPoint(s, 0, [2, 0], 0.1)
+      if (e) events.push(e.type)
+    }, 20)
+    expect(events).toEqual(['neutralized', 'captured'])
+    expect(s.points[0].owner).toBe(0)
   })
-
-  it('ignores hits while invulnerable but not falls', () => {
-    let s = createRun(5)
-    s = damage(s).state
-    expect(s.lives).toBe(CONFIG.run.lives - 1)
-    expect(damage(s).hurt).toBe(false)
-    s = damage(s, true).state
-    expect(s.lives).toBe(CONFIG.run.lives - 2)
+  it('supports more than two teams', () => {
+    const s = createMatch([...kinds], 3)
+    run(() => stepPoint(s, 2, [0, 0, 2], 0.1), 10)
+    expect(s.points[2].owner).toBe(2)
+    expect(s.scores).toHaveLength(3)
   })
+})
 
-  it('loses on zero lives or when time runs out', () => {
-    let s = createRun(5)
-    for (let i = 0; i < CONFIG.run.lives; i += 1) s = damage(s, true).state
-    expect(s.phase).toBe('lost')
-    expect(s.loseReason).toBe('lives')
-    const t = tick(createRun(5), CONFIG.run.seconds)
-    expect(t.phase).toBe('lost')
-    expect(t.loseReason).toBe('time')
+describe('match', () => {
+  it('scores owned points every second, the egg worth more', () => {
+    const s = createMatch([...kinds])
+    s.points[0].owner = 0
+    s.points[eggIndex(s)].owner = 1
+    tickMatch(s, 1)
+    expect(s.scores).toEqual([CONFIG.match.tick.building, CONFIG.match.tick.egg])
   })
-
-  it('freezes state after the run ends', () => {
-    const lost = tick(createRun(5), CONFIG.run.seconds)
-    expect(tick(lost, 1)).toBe(lost)
-    expect(collect(lost).points).toBe(0)
+  it('wins by holding the Golden Egg long enough', () => {
+    const s = createMatch([...kinds])
+    s.points[eggIndex(s)].owner = 1
+    let end = null
+    for (let i = 0; i < CONFIG.match.eggHoldToWin + 2 && !end; i += 1) end = tickMatch(s, 1)
+    expect(end).toMatchObject({ type: 'ended', winner: 1, reason: 'egg' })
   })
-
-  it('rates stars', () => {
-    let s = collect(createRun(1)).state
-    expect(stars(s)).toBe(3)
-    s = collect(damage(tick(createRun(1), CONFIG.run.seconds * 0.6)).state).state
-    expect(stars(s)).toBe(1)
-    expect(stars(createRun(1))).toBe(0)
+  it('wins on target score and awards kill points', () => {
+    const s = createMatch([...kinds])
+    s.scores[0] = CONFIG.match.targetScore - CONFIG.match.killPoints
+    addKill(s, 0)
+    expect(s.kills[0]).toBe(1)
+    expect(tickMatch(s, 0.01)).toMatchObject({ winner: 0, reason: 'score' })
   })
-
-  it('formats the clock', () => {
-    expect(formatClock(150)).toBe('2:30')
-    expect(formatClock(59.2)).toBe('1:00')
+  it('ends on time with the leader, and freezes afterwards', () => {
+    const s = createMatch([...kinds])
+    s.scores = [10, 20]
+    const e = tickMatch(s, CONFIG.match.seconds)
+    expect(e).toMatchObject({ winner: 1, reason: 'time' })
+    expect(tickMatch(s, 1)).toBeNull()
+    addKill(s, 0)
+    expect(s.scores[0]).toBe(10)
+  })
+  it('detects ties and formats the clock', () => {
+    const s = createMatch([...kinds])
+    s.scores = [5, 5]
+    expect(leader(s)).toBe(-1)
+    expect(formatClock(125)).toBe('2:05')
     expect(formatClock(0)).toBe('0:00')
   })
 })

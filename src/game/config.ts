@@ -1,57 +1,95 @@
-/**
- * All gameplay tuning in one place. Change numbers here before touching game code; tests read
- * the same values so rule changes stay covered.
- */
+/** Every tuning number for 金蛋争夺战 lives here. */
 export const CONFIG = {
-  run: {
-    seconds: 150,
-    lives: 3,
-    /** Seconds of invulnerability after a hit. */
-    invulnerable: 1.6,
-    /** Falling below this height costs a life and respawns at the last checkpoint. */
-    killY: -18,
+  match: {
+    seconds: 600,
+    targetScore: 1000,
+    /** Seconds a team must keep the Golden Egg to win outright. */
+    eggHoldToWin: 120,
+    killPoints: 2,
+    /** Team points granted every second for each owned point, by kind. */
+    tick: { building: 1, egg: 2 },
   },
-  score: {
-    core: 100,
-    /** Consecutive pickups within `comboWindow` seconds raise the multiplier up to `comboMax`. */
-    comboWindow: 3.5,
-    comboMax: 5,
-    /** Bonus per second left on the clock when every core is collected. */
-    timeBonus: 25,
-    lifeBonus: 500,
+  capture: {
+    /** Progress per second for one capturer (a full capture is 0 → 1). */
+    rate: 0.14,
+    eggRate: 0.09,
+    maxUnits: 3,
+    decay: 0.05,
   },
   player: {
-    radius: 0.42,
-    halfHeight: 0.5,
-    walkSpeed: 7,
-    sprintSpeed: 11,
-    acceleration: 60,
-    airControl: 0.45,
-    jumpSpeed: 10.5,
-    gravity: -30,
-    /** Extra gravity when the jump button is released early, for variable jump height. */
-    lowJumpGravity: -58,
-    maxFall: -40,
-    coyoteTime: 0.12,
-    jumpBuffer: 0.14,
-    dashSpeed: 22,
-    dashTime: 0.16,
-    dashCooldown: 0.9,
-    turnSpeed: 14,
+    radius: 0.4,
+    height: 1.75,
+    crouchHeight: 1.2,
+    eye: 1.62,
+    crouchEye: 1.1,
+    walk: 6.2,
+    sprint: 9.2,
+    crouchSpeed: 3.2,
+    swimSpeed: 3.4,
+    accel: 60,
+    airAccel: 14,
+    jump: 6.6,
+    gravity: -19,
+    step: 0.62,
+    hp: 100,
+    respawn: 4,
+    spawnShield: 2.5,
+    fov: 74,
+    adsFov: 48,
   },
-  camera: {
-    distance: 6.4,
-    height: 2.4,
-    minPitch: -0.35,
-    maxPitch: 1.1,
-    follow: 10,
-    fov: 62,
+  weapon: {
+    name: 'KT-9 脉冲步枪',
+    mag: 30,
+    reserve: 150,
+    maxReserve: 210,
+    rpm: 620,
+    damage: 25,
+    headMult: 2.1,
+    reload: 2.1,
+    range: 240,
+    spread: 0.0035,
+    moveSpread: 0.028,
+    airSpread: 0.06,
+    bloomPerShot: 0.006,
+    bloomMax: 0.05,
+    recoilPitch: 0.013,
+    recoilYaw: 0.004,
+    recoilRecover: 7,
   },
-  drones: {
-    speed: 3.2,
-    radius: 0.7,
-    /** Drones speed up as the clock runs down. */
-    rageSpeed: 5,
-    rageAt: 45,
+  grenade: { start: 2, max: 4, fuse: 2.2, radius: 7.5, damage: 115, speed: 19 },
+  bots: {
+    perTeam: 6,
+    hp: 100,
+    speed: 5.3,
+    viewRange: 70,
+    fov: 2.4,
+    reaction: [0.35, 0.75] as const,
+    burst: [3, 6] as const,
+    fireInterval: 0.12,
+    burstPause: [0.45, 1.1] as const,
+    damage: 10,
+    spread: 0.03,
+    regenDelay: 6,
+    regen: 6,
+    respawn: 6,
   },
+  stations: {
+    supplyCooldown: 20,
+    supplyAmmo: 90,
+    skillDuration: 22,
+    skillCooldown: 40,
+    shield: 60,
+    healRate: 24,
+    baseHealRate: 30,
+  },
+  car: { hp: 480, maxSpeed: 24, reverse: 9, accel: 15, brake: 30, turn: 1.9, radius: 1.9, gunDamage: 16, gunInterval: 0.09, ramDamage: 140, respawn: 25 },
+  boat: { hp: 300, maxSpeed: 30, reverse: 8, accel: 16, brake: 18, turn: 1.5, radius: 2.2, gunDamage: 14, gunInterval: 0.1, respawn: 25 },
+  drone: { duration: 15, cooldown: 35, height: 46, speed: 26, markRadius: 42, markTime: 20 },
+  heli: { hp: 700, cruise: 28, height: 30, supportTime: 16, cooldown: 75, gunDamage: 9, gunInterval: 0.14, range: 60, respawn: 60, enemyFirstCall: 100, enemyInterval: 110 },
 } as const
+
+export const TEAM_NAMES = ['红方 · 赤焰', '蓝方 · 海鹰'] as const
+export const TEAM_SHORT = ['红方', '蓝方'] as const
+export const TEAM_COLORS = [0xff4d5e, 0x3fa9ff] as const
+export const TEAM_CSS = ['#ff4d5e', '#3fa9ff'] as const
+export const PLAYER_TEAM = 0

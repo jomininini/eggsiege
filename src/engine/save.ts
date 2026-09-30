@@ -1,92 +1,55 @@
 /**
- * Versioned local save. Everything the player keeps between sessions lives in one JSON record so
- * it is easy to migrate. Corrupt or foreign data falls back to defaults instead of crashing.
+ * Versioned local save: settings plus a small career record. Corrupt data falls back to defaults.
  */
-export type Locale = 'en' | 'zh-CN'
 export type Quality = 'low' | 'medium' | 'high'
-
-export type ScoreEntry = { name: string; score: number; seconds: number; at: number }
-
 export type SaveData = {
-  version: 1
-  /** '' = never chosen; the game follows the browser language until the player picks one. */
-  locale: Locale | ''
+  version: 2
   musicVolume: number
   sfxVolume: number
   muted: boolean
   sensitivity: number
   invertY: boolean
   quality: Quality
-  reducedMotion: boolean
-  tutorialDone: boolean
-  playerName: string
-  leaderboard: ScoreEntry[]
+  wins: number
+  matches: number
+  bestKills: number
 }
-
-export const SAVE_KEY = 'game3d.save'
-export const LEADERBOARD_SIZE = 10
+export const SAVE_KEY = 'eggsiege.save'
 
 export function defaultSave(): SaveData {
-  return {
-    version: 1,
-    locale: '',
-    musicVolume: 0.7,
-    sfxVolume: 0.8,
-    muted: false,
-    sensitivity: 1,
-    invertY: false,
-    quality: 'high',
-    reducedMotion: false,
-    tutorialDone: false,
-    playerName: 'PLAYER',
-    leaderboard: [],
-  }
+  return { version: 2, musicVolume: 0.5, sfxVolume: 0.8, muted: false, sensitivity: 1, invertY: false, quality: 'high', wins: 0, matches: 0, bestKills: 0 }
 }
+const clamp01 = (v: unknown, f: number) => (typeof v === 'number' && Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : f)
+const count = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0)
 
-const clamp01 = (v: unknown, fallback: number) => (typeof v === 'number' && Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : fallback)
-
-/** Parse untrusted stored JSON into a valid SaveData (pure; unit tested). */
 export function parseSave(raw: string | null): SaveData {
   const base = defaultSave()
   if (!raw) return base
-  let data: Record<string, unknown>
+  let d: Record<string, unknown>
   try {
-    const parsed = JSON.parse(raw)
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return base
-    data = parsed as Record<string, unknown>
+    const p = JSON.parse(raw)
+    if (!p || typeof p !== 'object' || Array.isArray(p)) return base
+    d = p as Record<string, unknown>
   } catch {
     return base
   }
-  if (data.version !== 1) return base
-  const board = Array.isArray(data.leaderboard) ? data.leaderboard : []
+  if (d.version !== 2) return base
   return {
-    version: 1,
-    locale: data.locale === 'en' || data.locale === 'zh-CN' ? data.locale : '',
-    musicVolume: clamp01(data.musicVolume, base.musicVolume),
-    sfxVolume: clamp01(data.sfxVolume, base.sfxVolume),
-    muted: data.muted === true,
-    sensitivity: typeof data.sensitivity === 'number' && data.sensitivity >= 0.2 && data.sensitivity <= 3 ? data.sensitivity : base.sensitivity,
-    invertY: data.invertY === true,
-    quality: data.quality === 'low' || data.quality === 'medium' || data.quality === 'high' ? data.quality : base.quality,
-    reducedMotion: data.reducedMotion === true,
-    tutorialDone: data.tutorialDone === true,
-    playerName: typeof data.playerName === 'string' && data.playerName.trim() ? data.playerName.trim().slice(0, 16) : base.playerName,
-    leaderboard: board
-      .filter((e): e is ScoreEntry => !!e && typeof e === 'object' && typeof (e as ScoreEntry).name === 'string' && Number.isFinite((e as ScoreEntry).score))
-      .map(e => ({ name: e.name.slice(0, 16), score: Math.max(0, Math.floor(e.score)), seconds: Number.isFinite(e.seconds) ? e.seconds : 0, at: Number.isFinite(e.at) ? e.at : 0 }))
-      .slice(0, LEADERBOARD_SIZE),
+    version: 2,
+    musicVolume: clamp01(d.musicVolume, base.musicVolume),
+    sfxVolume: clamp01(d.sfxVolume, base.sfxVolume),
+    muted: d.muted === true,
+    sensitivity: typeof d.sensitivity === 'number' && d.sensitivity >= 0.2 && d.sensitivity <= 3 ? d.sensitivity : base.sensitivity,
+    invertY: d.invertY === true,
+    quality: d.quality === 'low' || d.quality === 'medium' || d.quality === 'high' ? d.quality : base.quality,
+    wins: count(d.wins),
+    matches: count(d.matches),
+    bestKills: count(d.bestKills),
   }
-}
-
-/** Insert a run into a bounded, deterministically ordered leaderboard (higher score, then faster, then earlier). */
-export function insertScore(board: ScoreEntry[], entry: ScoreEntry): { board: ScoreEntry[]; rank: number } {
-  const next = [...board, entry].sort((a, b) => b.score - a.score || a.seconds - b.seconds || a.at - b.at).slice(0, LEADERBOARD_SIZE)
-  return { board: next, rank: next.indexOf(entry) }
 }
 
 export class SaveStore {
   data: SaveData
-
   constructor(private readonly storage: Pick<Storage, 'getItem' | 'setItem'> | undefined = globalThis.localStorage) {
     let raw: string | null = null
     try {
@@ -96,13 +59,12 @@ export class SaveStore {
     }
     this.data = parseSave(raw)
   }
-
   update(patch: Partial<SaveData>): void {
     this.data = { ...this.data, ...patch }
     try {
       this.storage?.setItem(SAVE_KEY, JSON.stringify(this.data))
     } catch {
-      // Private browsing or quota: the game keeps working with in-memory settings.
+      // Private mode: keep settings in memory.
     }
   }
 }
