@@ -3,17 +3,21 @@ import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
 import { Collision } from './collide'
 import { TEAM_CSS, TEAM_COLORS } from './config'
+import { L } from './i18n'
 import {
-  BASES, BOAT_SPAWNS, BUILDINGS, DRONE_PADS, EGG, HELIPADS, LAND, PIERS, POINTS, ROADS, SHORE_Z, SKILLS, STATIONS,
-  WATER_Y, type BuildingDef, type StationDef,
+  BASES, BOAT_SPAWNS, BRIDGES, BUILDINGS, CANAL, DRONE_PADS, EGG, HELIPADS, ISLAND, ISLAND_JETTIES, LAKE, LAND, PIERS, POINTS, ROADS,
+  SHORE_Z, SKILLS, STATIONS, WATER_Y, isInlandWater, pointShort, type BuildingDef, type StationDef,
 } from './map'
-import { badgeTexture, eggTexture, facadeTextures, groundTexture, helipadTexture, labelSprite, signMesh, skyTexture } from './textures'
+import { badgeTexture, eggTexture, facadeTextures, groundTexture, helipadTexture, signMesh, skyTexture, textTexture } from './textures'
 
 const UNIT = new THREE.BoxGeometry(1, 1, 1)
 const NEUTRAL = 0xe8edf2
 
 export type PointVisual = { ring: THREE.Mesh; disk: THREE.Mesh; beam: THREE.Mesh; badge: THREE.Sprite; badgeTex: THREE.Texture[] }
 export type StationVisual = { def: StationDef; ring: THREE.Mesh; icon: THREE.Sprite; baseY: number }
+type TextOpts = Parameters<typeof textTexture>[1]
+type LabelEntry = { obj: THREE.Sprite | THREE.Mesh; zh: string; en: string; h: number; opts: TextOpts }
+type BadgeEntry = { sprite: THREE.Sprite; zh: string; en: string; color: string }
 
 /** Builds the Science Park battlefield: meshes into the scene, solids into the collision world. */
 export class World {
@@ -26,6 +30,13 @@ export class World {
   private seaBase!: Float32Array
   private readonly mats: Record<string, THREE.Material>
   private facadeCache = new Map<number, [THREE.CanvasTexture, THREE.CanvasTexture]>()
+  private labels: LabelEntry[] = []
+  private badges: BadgeEntry[] = []
+  private pointOwners: number[] = POINTS.map(() => -1)
+  /** Allow solid boxes over the lake/canal (bridges, piers). */
+  private allowWater = false
+  /** Meshes hidden outside 出海模式. */
+  readonly seaOnly: THREE.Object3D[] = []
 
   constructor(readonly scene: THREE.Scene, renderer: THREE.WebGLRenderer) {
     const pmrem = new THREE.PMREMGenerator(renderer)
@@ -67,6 +78,8 @@ export class World {
     }
     this.ground()
     this.seaAndShore()
+    this.lakeAndCanal()
+    this.island()
     this.backdrop()
     for (const b of BUILDINGS) this.building(b)
     this.egg()
@@ -83,6 +96,8 @@ export class World {
     const dynamic = new Set<THREE.Object3D>([this.sea])
     for (const p of this.points) dynamic.add(p.ring).add(p.disk).add(p.beam)
     for (const s of this.stations) dynamic.add(s.ring)
+    for (const l of this.labels) dynamic.add(l.obj)
+    for (const o of this.seaOnly) dynamic.add(o)
     const groups = new Map<string, { mat: THREE.Material; cast: boolean; meshes: THREE.Mesh[] }>()
     for (const o of [...this.scene.children]) {
       const m = o as THREE.Mesh
@@ -118,15 +133,81 @@ export class World {
   }
 
   // ─── helpers ────────────────────────────────────────────────────────────
-  box(x: number, y0: number, z: number, w: number, h: number, d: number, mat: THREE.Material, collide = true, shadow = true): THREE.Mesh {
+  box(x: number, y0: number, z: number, w: number, h: number, d: number, mat: THREE.Material, collide = true, shadow = true, tag?: string): THREE.Mesh {
     const m = new THREE.Mesh(UNIT, mat)
     m.position.set(x, y0 + h / 2, z)
     m.scale.set(w, h, d)
     m.castShadow = shadow
     m.receiveShadow = true
+    // Ground clutter never lands in the lake or canal (keeps the waterway navigable).
+    if (!this.allowWater && y0 < 1 && y0 > -0.5 && this.overInlandWater(x, z, w, d)) return m
     this.scene.add(m)
-    if (collide) this.col.add({ minX: x - w / 2, maxX: x + w / 2, minY: y0, maxY: y0 + h, minZ: z - d / 2, maxZ: z + d / 2 })
+    if (collide) this.col.add({ minX: x - w / 2, maxX: x + w / 2, minY: y0, maxY: y0 + h, minZ: z - d / 2, maxZ: z + d / 2, tag })
     return m
+  }
+
+  private overInlandWater(x: number, z: number, w: number, d: number): boolean {
+    for (const fx of [-0.5, 0, 0.5]) for (const fz of [-0.5, 0, 0.5]) if (isInlandWater(x + fx * w, z + fz * d)) return true
+    return false
+  }
+
+  /** Camera-facing bilingual label; refreshed by relabel() when the language changes. */
+  label(zh: string, en: string, height: number, opts: TextOpts = {}, depthTest = true): THREE.Sprite {
+    const { texture, aspect } = textTexture(L(zh, en), opts)
+    const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: texture, depthTest, transparent: true, toneMapped: false }))
+    s.scale.set(height * aspect, height, 1)
+    this.labels.push({ obj: s, zh, en, h: height, opts })
+    return s
+  }
+
+  /** Flat bilingual sign mesh. */
+  signText(zh: string, en: string, height: number, opts: TextOpts = {}): THREE.Mesh {
+    const m = signMesh(L(zh, en), height, opts)
+    this.labels.push({ obj: m, zh, en, h: height, opts })
+    return m
+  }
+
+  badge(zh: string, en: string, color: string, scale: number): THREE.Sprite {
+    const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: badgeTexture(L(zh, en), color), toneMapped: false, transparent: true }))
+    s.scale.setScalar(scale)
+    this.badges.push({ sprite: s, zh, en, color })
+    return s
+  }
+
+  /** Redraw every in-world text for the current language. */
+  relabel(): void {
+    for (const l of this.labels) {
+      const { texture, aspect } = textTexture(L(l.zh, l.en), l.opts)
+      const mat = (l.obj as THREE.Mesh).material as THREE.SpriteMaterial | THREE.MeshBasicMaterial
+      mat.map?.dispose()
+      mat.map = texture
+      mat.needsUpdate = true
+      if ((l.obj as THREE.Sprite).isSprite) l.obj.scale.set(l.h * aspect, l.h, 1)
+      else {
+        const m = l.obj as THREE.Mesh
+        m.geometry.dispose()
+        m.geometry = new THREE.PlaneGeometry(l.h * aspect, l.h)
+      }
+    }
+    for (const b of this.badges) {
+      const mat = b.sprite.material
+      mat.map?.dispose()
+      mat.map = badgeTexture(L(b.zh, b.en), b.color)
+      mat.needsUpdate = true
+    }
+    POINTS.forEach((p, i) => {
+      const v = this.points[i]
+      for (const t of v.badgeTex) t.dispose()
+      v.badgeTex = [badgeTexture(pointShort(p), '#e8edf2'), badgeTexture(pointShort(p), TEAM_CSS[0]), badgeTexture(pointShort(p), TEAM_CSS[1])]
+      const sm = v.badge.material as THREE.SpriteMaterial
+      sm.map = v.badgeTex[this.pointOwners[i] + 1]
+      sm.needsUpdate = true
+    })
+  }
+
+  /** Show or hide 出海模式-only objects (island capture ring). */
+  setSeaMode(sea: boolean): void {
+    for (const o of this.seaOnly) o.visible = sea
   }
 
   private facade(tint: number, w: number, h: number, rows = 3.6): THREE.MeshStandardMaterial {
@@ -157,13 +238,43 @@ export class World {
   // ─── ground, sea, backdrop ──────────────────────────────────────────────
   private ground(): void {
     const paving = groundTexture('#cdc8bc', 'rgba(120,110,95,0.28)', 256, 32)
-    paving.repeat.set(90, 60)
-    const land = this.flatPlane(0, (SHORE_Z + 420) / 2, 900, 420 - SHORE_Z, new THREE.MeshStandardMaterial({ map: paving, roughness: 0.95 }), 0)
-    land.position.z = (SHORE_Z + 420) / 2
+    paving.repeat.set(0.1, 0.1)
+    // Land outline in shape space (x, -z) with the canal notch and the egg lake carved out.
+    const shape = new THREE.Shape()
+    const hw = CANAL.halfW
+    const a0 = Math.asin(hw / LAKE.r)
+    shape.moveTo(-450, -SHORE_Z)
+    shape.lineTo(-hw, -SHORE_Z)
+    shape.lineTo(-hw, -(-Math.cos(a0) * LAKE.r))
+    // Around the lake (through its south side) back to the east canal bank.
+    const steps = 48
+    const start = Math.PI / 2 + a0, end = Math.PI * 2 + Math.PI / 2 - a0
+    for (let i = 0; i <= steps; i += 1) {
+      const a = start + ((end - start) * i) / steps
+      // Lake point at angle a measured from +x in shape space (y = -z).
+      shape.lineTo(LAKE.x + Math.cos(a) * LAKE.r, -LAKE.z + Math.sin(a) * LAKE.r)
+    }
+    shape.lineTo(hw, -SHORE_Z)
+    shape.lineTo(450, -SHORE_Z)
+    shape.lineTo(450, -420)
+    shape.lineTo(-450, -420)
+    shape.closePath()
+    const landGeo = new THREE.ShapeGeometry(shape, 8)
+    landGeo.rotateX(-Math.PI / 2)
+    const land = new THREE.Mesh(landGeo, new THREE.MeshStandardMaterial({ map: paving, roughness: 0.95 }))
+    land.receiveShadow = true
+    this.scene.add(land)
     const asphaltTex = groundTexture('#3c4148', 'rgba(255,255,255,0.0)', 64, 64)
     const asphalt = new THREE.MeshStandardMaterial({ map: asphaltTex, roughness: 0.9, color: 0xffffff })
     const dash = new THREE.MeshBasicMaterial({ color: 0xf2f2e6 })
+    const segments: typeof ROADS = []
     for (const r of ROADS) {
+      // East-west roads crossing the canal are split; the bridge deck carries them over.
+      if (r.z0 === r.z1 && r.x0 < 0 && r.x1 > 0 && r.z0 > SHORE_Z && r.z0 < CANAL.z1) {
+        segments.push({ ...r, x1: -5.2 }, { ...r, x0: 5.2 })
+      } else segments.push(r)
+    }
+    for (const r of segments) {
       const len = Math.hypot(r.x1 - r.x0, r.z1 - r.z0)
       const ang = Math.atan2(r.x1 - r.x0, r.z1 - r.z0)
       const cx = (r.x0 + r.x1) / 2, cz = (r.z0 + r.z1) / 2
@@ -177,16 +288,15 @@ export class World {
     // Lawns around the park.
     const lawns: [number, number, number, number][] = [
       [-62, 12, 34, 20], [62, 12, 34, 20], [-100, -12, 16, 40], [100, -12, 16, 40], [-40, 60, 20, 14], [40, 60, 20, 14],
-      [-62, 72, 30, 12], [62, 72, 30, 12], [0, -62, 40, 8],
+      [-62, 72, 30, 12], [62, 72, 30, 12], [-13, -62, 14, 8], [13, -62, 14, 8],
     ]
     for (const [x, z, w, d] of lawns) this.flatPlane(x, z, w, d, this.mats.grass, 0.02)
     // Egg plaza disc and reflecting pools.
-    const plaza = new THREE.Mesh(new THREE.CircleGeometry(21, 48), new THREE.MeshStandardMaterial({ color: 0xe6e0d4, roughness: 0.8 }))
+    const plaza = new THREE.Mesh(new THREE.RingGeometry(LAKE.r + 0.6, 21, 64), new THREE.MeshStandardMaterial({ color: 0xe6e0d4, roughness: 0.8 }))
     plaza.rotation.x = -Math.PI / 2
     plaza.position.set(EGG.x, 0.03, EGG.z)
     plaza.receiveShadow = true
     this.scene.add(plaza)
-    this.flatPlane(0, -24, 26, 5, this.mats.pool, 0.04)
     this.flatPlane(0, 23, 18, 3, this.mats.pool, 0.04)
   }
 
@@ -201,30 +311,212 @@ export class World {
     const bed = this.flatPlane(0, SHORE_Z - 200, 1500, 400, new THREE.MeshStandardMaterial({ color: 0x1b3f4f }), -3.2)
     bed.receiveShadow = false
     // Seawall and promenade boardwalk.
-    this.box(0, -3.2, SHORE_Z - 0.5, 900, 3.2, 1, this.mats.concrete, false, false)
-    const deck = groundTexture('#b98a5b', 'rgba(80,50,20,0.35)', 128, 16)
-    deck.repeat.set(160, 2)
-    this.flatPlane(0, SHORE_Z + 5, 900, 10, new THREE.MeshStandardMaterial({ map: deck, roughness: 0.9 }), 0.02)
+    const hw = CANAL.halfW
+    for (const sx of [-1, 1]) {
+      this.box(sx * (225 + hw / 2), -3.2, SHORE_Z - 0.5, 450 - hw, 3.2, 1, this.mats.concrete, false, false)
+      const deck = groundTexture('#b98a5b', 'rgba(80,50,20,0.35)', 128, 16)
+      deck.repeat.set(80, 2)
+      this.flatPlane(sx * (225 + hw / 2), SHORE_Z + 5, 450 - hw, 10, new THREE.MeshStandardMaterial({ map: deck, roughness: 0.9 }), 0.02)
+    }
     for (let x = -126; x <= 126; x += 14) {
+      if (Math.abs(x) < 7) continue
       this.box(x, 0, SHORE_Z + 1.2, 0.18, 4.2, 0.18, this.mats.dark, false, false)
       this.box(x, 4.2, SHORE_Z + 1.2, 0.5, 0.18, 0.5, this.mats.ledWarm, false, false)
     }
     // Piers with lit edges.
     for (const p of PIERS) {
-      this.box(p.x, -2.4, SHORE_Z - p.len / 2, p.w, 2.4, p.len, this.mats.wood)
+      this.box(p.x, -2.4, SHORE_Z - p.len / 2, p.w, 2.4, p.len, this.mats.wood, true, true, 'deck')
       for (let z = SHORE_Z - 2; z > SHORE_Z - p.len; z -= 4) {
         this.box(p.x - p.w / 2 + 0.3, 0, z, 0.2, 1, 0.2, this.mats.dark, false, false)
         this.box(p.x + p.w / 2 - 0.3, 0, z, 0.2, 1, 0.2, this.mats.dark, false, false)
       }
       this.box(p.x, 0, SHORE_Z - p.len + 0.3, p.w, 0.12, 0.3, new THREE.MeshBasicMaterial({ color: TEAM_COLORS[p.team], toneMapped: false }), false, false)
-      const sign = labelSprite(p.team === 0 ? '红方码头' : '蓝方码头', 1.4, { color: '#fff', bg: TEAM_CSS[p.team], size: 44, pad: 12 })
+      const sign = p.team === 0 ? this.label('红方码头', 'Red Pier', 1.4, { color: '#fff', bg: TEAM_CSS[p.team], size: 44, pad: 12 }) : this.label('蓝方码头', 'Blue Pier', 1.4, { color: '#fff', bg: TEAM_CSS[p.team], size: 44, pad: 12 })
       sign.position.set(p.x, 3.2, SHORE_Z - 1)
       this.scene.add(sign)
     }
     for (const b of BOAT_SPAWNS) {
+      if (b.sea) continue
       const buoy = this.box(b.x + 6, WATER_Y - 0.4, b.z - 6, 0.8, 1.4, 0.8, new THREE.MeshStandardMaterial({ color: TEAM_COLORS[b.team] }), false, false)
       buoy.rotation.y = 0.6
     }
+  }
+
+  // ─── lake, canal and bridges ────────────────────────────────────────────
+  private lakeAndCanal(): void {
+    const hw = CANAL.halfW
+    const len = CANAL.z1 - SHORE_Z + 1
+    const water = new THREE.MeshStandardMaterial({ color: 0x2a8fae, roughness: 0.1, metalness: 0.3, transparent: true, opacity: 0.88, emissive: 0x0b3b4a, emissiveIntensity: 0.4 })
+    const bedMat = new THREE.MeshStandardMaterial({ color: 0x3d5a60, roughness: 1 })
+    const wallMat = new THREE.MeshStandardMaterial({ color: 0xbfc4c2, roughness: 0.9 })
+    const lake = new THREE.Mesh(new THREE.CircleGeometry(LAKE.r, 64), water)
+    lake.rotation.x = -Math.PI / 2
+    lake.position.set(LAKE.x, WATER_Y + 0.02, LAKE.z)
+    this.scene.add(lake)
+    this.flatPlane(0, SHORE_Z + len / 2, hw * 2, len, water, WATER_Y + 0.02)
+    this.flatPlane(0, SHORE_Z + len / 2, hw * 2, len, bedMat, -1.85)
+    const bed = new THREE.Mesh(new THREE.CircleGeometry(LAKE.r, 48), bedMat)
+    bed.rotation.x = -Math.PI / 2
+    bed.position.set(LAKE.x, -1.85, LAKE.z)
+    this.scene.add(bed)
+    const wall = new THREE.Mesh(new THREE.CylinderGeometry(LAKE.r, LAKE.r, 1.9, 64, 1, true), wallMat)
+    ;(wall.material as THREE.Material).side = THREE.DoubleSide
+    wall.position.set(LAKE.x, -0.93, LAKE.z)
+    this.scene.add(wall)
+    this.allowWater = true
+    for (const sx of [-1, 1]) {
+      this.box(sx * (hw + 0.2), -1.9, SHORE_Z + len / 2 - 0.6, 0.4, 1.9, len - 1.2, wallMat, false, false)
+      // Glowing canal kerb.
+      this.box(sx * (hw + 0.25), 0, SHORE_Z + len / 2, 0.5, 0.12, len, this.mats.led, false, false)
+    }
+    // Lake kerb ring with LED.
+    const kerb = new THREE.Mesh(new THREE.TorusGeometry(LAKE.r + 0.3, 0.08, 6, 96), this.mats.led)
+    kerb.rotation.x = Math.PI / 2
+    kerb.position.set(LAKE.x, 0.1, LAKE.z)
+    this.scene.add(kerb)
+    this.bridges()
+    // Submerged steps so swimmers and landing parties can climb out of the lake.
+    const stepMat = new THREE.MeshStandardMaterial({ color: 0xc9c6bd, roughness: 0.9 })
+    for (const deg of [35, 90, 145, 215, 325]) {
+      const a = (deg * Math.PI) / 180
+      for (let i = 0; i < 3; i += 1) {
+        const r = LAKE.r - 0.5 - i * 1.0
+        const top = -0.38 - i * 0.4
+        const m = this.box(LAKE.x + Math.cos(a) * r, -1.9, LAKE.z + Math.sin(a) * r, 1.0, top + 1.9, 3, stepMat, false, false)
+        m.rotation.y = -a
+        const cx = LAKE.x + Math.cos(a) * r, cz = LAKE.z + Math.sin(a) * r
+        this.col.add({ minX: cx - 0.9, maxX: cx + 0.9, minY: -1.9, maxY: top, minZ: cz - 0.9, maxZ: cz + 0.9, tag: 'deck' })
+      }
+    }
+    this.allowWater = false
+    const sign = this.label('金蛋湖 · 水道通往海港', 'Egg Lake · canal to the harbour', 0.9, { color: '#bff8ff', bg: 'rgba(5,30,40,0.8)', size: 44, pad: 10 })
+    sign.position.set(7.5, 2.4, -20)
+    this.scene.add(sign)
+  }
+
+  private bridges(): void {
+    const half = CANAL.halfW + 0.7
+    const steel = this.mats.steel
+    const asphalt = new THREE.MeshStandardMaterial({ color: 0x40464e, roughness: 0.9 })
+    const plank = new THREE.MeshStandardMaterial({ color: 0xb98a5b, roughness: 0.9 })
+    for (const br of BRIDGES) {
+      const deckMat = br.road ? asphalt : plank
+      this.box(0, br.top - 0.35, br.z, half * 2, 0.35, br.w, deckMat, true, true, 'deck')
+      this.box(0, br.top - 0.75, br.z, half * 2, 0.4, br.w - 0.6, steel, false, true)
+      const steps = 6, run = 1.35
+      for (const side of [-1, 1]) {
+        for (let i = 0; i < steps; i += 1) {
+          const top = ((i + 1) * br.top) / steps
+          this.box(side * (half + (steps - 1 - i + 0.5) * run), 0, br.z, run, top, br.w, deckMat, true, i % 2 === 0, 'deck')
+        }
+        // Piers on the canal banks.
+        this.box(side * (CANAL.halfW + 0.35), -1.9, br.z, 0.7, br.top - 0.75 + 1.9, br.w - 1, this.mats.concrete, false, true)
+      }
+      for (const sz of [-1, 1]) {
+        this.box(0, br.top, br.z + sz * (br.w / 2 - 0.1), half * 2, 0.95, 0.12, this.mats.glass, true, false)
+        this.box(0, br.top - 0.8, br.z + sz * (br.w / 2 + 0.02), half * 2, 0.08, 0.06, this.mats.led, false, false)
+      }
+    }
+  }
+
+  // ─── 出海岛 (Offshore Isle) ─────────────────────────────────────────────
+  private island(): void {
+    const I = ISLAND
+    const sand = new THREE.MeshStandardMaterial({ color: 0xe0c98f, roughness: 1, flatShading: true })
+    const body = new THREE.Mesh(new THREE.CylinderGeometry(1, 1.3, 1, 48, 1), sand)
+    body.scale.set(I.rx, I.y + 3.2, I.rz)
+    body.position.set(I.x, (I.y - 3.2) / 2, I.z)
+    body.receiveShadow = true
+    this.scene.add(body)
+    const grassGeo = new THREE.CircleGeometry(1, 40)
+    const grass = new THREE.Mesh(grassGeo, new THREE.MeshStandardMaterial({ color: 0x79a45a, roughness: 1 }))
+    grass.rotation.x = -Math.PI / 2
+    grass.scale.set(I.rx - 6, I.rz - 4.5, 1)
+    grass.position.set(I.x, I.y + 0.02, I.z)
+    grass.receiveShadow = true
+    this.scene.add(grass)
+    // Concrete apron around the objective and the battery.
+    this.flatPlane(I.x, I.z + 1, 22, 12, new THREE.MeshStandardMaterial({ color: 0xc9c6bd, roughness: 0.9 }), I.y + 0.03)
+    this.flatPlane(I.x, I.z - 11, 12, 7, new THREE.MeshStandardMaterial({ color: 0x9da3a6, roughness: 0.9 }), I.y + 0.035)
+    // Sandbag ring with gaps facing the four approaches.
+    const bag = new THREE.MeshStandardMaterial({ color: 0xb3a078, roughness: 1, flatShading: true })
+    for (let i = 0; i < 12; i += 1) {
+      if (i % 3 === 0) continue
+      const a = (i / 12) * Math.PI * 2 + 0.26
+      const x = I.x + Math.cos(a) * 10.5, z = I.z + 1 + Math.sin(a) * 7.2
+      const m = this.box(x, I.y, z, 3.2, 1.05, 0.9, bag)
+      m.rotation.y = -a + Math.PI / 2
+    }
+    // Command bunker and supply crates.
+    this.box(I.x - 9, I.y, I.z - 9, 5, 2.8, 3.6, this.mats.concrete)
+    this.box(I.x - 9, I.y + 2.8, I.z - 9, 5.6, 0.3, 4.2, this.mats.dark, false)
+    this.box(I.x + 8, I.y, I.z + 8, 1.4, 1.4, 1.4, this.mats.crate)
+    this.box(I.x + 9.6, I.y, I.z + 8.3, 1.4, 1.4, 1.4, this.mats.crateTeal)
+    this.box(I.x - 6, I.y, I.z + 9, 3, 1.1, 0.7, this.mats.barrier)
+    // Lighthouse on the north-east tip.
+    const lx = I.x + 22, lz = I.z - 8
+    const white = new THREE.MeshStandardMaterial({ color: 0xf4f4f0, roughness: 0.6 })
+    const red = new THREE.MeshStandardMaterial({ color: 0xd8413a, roughness: 0.6 })
+    for (let i = 0; i < 4; i += 1) {
+      const seg = new THREE.Mesh(new THREE.CylinderGeometry(1.35 - i * 0.12, 1.5 - i * 0.12, 3, 16), i % 2 ? red : white)
+      seg.position.set(lx, I.y + 1.5 + i * 3, lz)
+      seg.castShadow = true
+      this.scene.add(seg)
+    }
+    this.col.add({ minX: lx - 1.3, maxX: lx + 1.3, minY: I.y, maxY: I.y + 12, minZ: lz - 1.3, maxZ: lz + 1.3 })
+    const lamp = new THREE.Mesh(new THREE.CylinderGeometry(0.8, 0.8, 1.2, 12), new THREE.MeshBasicMaterial({ color: new THREE.Color(0xfff0b0).multiplyScalar(2), toneMapped: false }))
+    lamp.position.set(lx, I.y + 12.6, lz)
+    lamp.userData.keep = true
+    this.scene.add(lamp)
+    const cap = new THREE.Mesh(new THREE.ConeGeometry(1.2, 1.2, 12), red)
+    cap.position.set(lx, I.y + 13.8, lz)
+    this.scene.add(cap)
+    // Palms and rocks.
+    const trunkMat = new THREE.MeshStandardMaterial({ color: 0x8a6a45, roughness: 1 })
+    const frond = new THREE.MeshStandardMaterial({ color: 0x3f8f4a, roughness: 0.9, flatShading: true, side: THREE.DoubleSide })
+    const palms: [number, number][] = [[-22, -6], [-24, 4], [-4, 12], [12, 11], [24, 3], [-12, -12], [6, -13]]
+    palms.forEach(([dx, dz], i) => {
+      const x = I.x + dx, z = I.z + dz
+      const lean = 0.18 + (i % 3) * 0.06
+      const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.3, 6, 6), trunkMat)
+      trunk.position.set(x, I.y + 3, z)
+      trunk.rotation.z = lean * (i % 2 ? 1 : -1)
+      trunk.castShadow = true
+      this.scene.add(trunk)
+      const topX = x - Math.sin(trunk.rotation.z) * 3, topY = I.y + 3 + Math.cos(trunk.rotation.z) * 3
+      for (let k = 0; k < 6; k += 1) {
+        const f = new THREE.Mesh(new THREE.ConeGeometry(0.55, 3.2, 4), frond)
+        f.position.set(topX, topY, z)
+        f.rotation.set(Math.PI / 2 - 0.5, (k / 6) * Math.PI * 2 + i, 0, 'YXZ')
+        f.translateY(1.4)
+        f.castShadow = true
+        this.scene.add(f)
+      }
+      this.col.add({ minX: x - 0.3, maxX: x + 0.3, minY: I.y, maxY: I.y + 5, minZ: z - 0.3, maxZ: z + 0.3 })
+    })
+    const rock = new THREE.MeshStandardMaterial({ color: 0x7d807c, roughness: 1, flatShading: true })
+    for (let i = 0; i < 14; i += 1) {
+      const a = (i / 14) * Math.PI * 2 + 0.4
+      if (Math.abs(Math.sin(a)) > 0.9 && Math.cos(a) * 0 === 0 && Math.sin(a) > 0) continue // keep the jetty side open
+      const r = new THREE.Mesh(new THREE.DodecahedronGeometry(1 + (i % 3) * 0.6, 0), rock)
+      r.position.set(I.x + Math.cos(a) * (I.rx + 2), -1 + (i % 2) * 0.3, I.z + Math.sin(a) * (I.rz + 1.6))
+      r.rotation.set(i, i * 2, 0)
+      r.castShadow = true
+      this.scene.add(r)
+    }
+    // Jetties for the patrol boats (south side, facing the park).
+    this.allowWater = true
+    for (const j of ISLAND_JETTIES) {
+      this.box(j.x, -2.4, (j.z0 + j.z1) / 2, j.w, 2.4 + I.y, j.z1 - j.z0, this.mats.wood, true, true, 'deck')
+      this.box(j.x, I.y, j.z1 - 0.2, j.w, 0.12, 0.3, new THREE.MeshBasicMaterial({ color: 0xffd35c, toneMapped: false }), false, false)
+    }
+    this.allowWater = false
+    const title = this.label('出海岛 · 海上前哨', 'Offshore Isle · sea outpost', 1.8, { color: '#fff4c2', bg: 'rgba(40,30,5,0.78)', size: 56, pad: 14 })
+    title.position.set(I.x, I.y + 7.5, I.z - 2)
+    this.scene.add(title)
+    const jettySign = this.label('巡逻艇码头 · 可经水道直达金蛋湖', 'Patrol jetty · canal to the Egg Lake', 0.8, { color: '#fff', bg: 'rgba(120,90,10,0.85)', size: 40, pad: 10 })
+    jettySign.position.set(I.x, I.y + 3, I.z + 15)
+    this.scene.add(jettySign)
   }
 
   private backdrop(): void {
@@ -276,7 +568,7 @@ export class World {
   }
 
   private sign(b: BuildingDef, text: string, y: number, face: 'n' | 's' | 'e' | 'w', height = 1.8, color = '#eafffb'): void {
-    const m = signMesh(text, height, { color, size: 72, pad: 10, stroke: 'rgba(0,0,0,0.35)' })
+    const m = this.signText(text, b.labelEn ?? text, height, { color, size: 72, pad: 10, stroke: 'rgba(0,0,0,0.35)' })
     const off = 0.08
     if (face === 'n') m.position.set(b.x, y, b.z - b.d / 2 - off), m.rotation.y = Math.PI
     if (face === 's') m.position.set(b.x, y, b.z + b.d / 2 + off)
@@ -407,7 +699,7 @@ export class World {
     this.box(b.x + 3.3, 0, b.z + front * (b.d / 2 + 2.6), 0.25, 3.2, 0.25, this.mats.steel, false)
     this.box(b.x, b.h, b.z, b.w - 1.5, 0.8, b.d - 1.5, this.mats.white, false)
     if (b.label) {
-      const m = signMesh(b.label, 1.7, { color: '#ffffff', size: 72, pad: 10, stroke: 'rgba(0,0,0,0.4)' })
+      const m = this.signText(b.label, b.labelEn ?? b.label, 1.7, { color: '#ffffff', size: 72, pad: 10, stroke: 'rgba(0,0,0,0.4)' })
       m.position.set(b.x, b.h - 2.6, b.z + front * (b.d / 2 + 0.1))
       if (front < 0) m.rotation.y = Math.PI
       this.scene.add(m)
@@ -433,7 +725,7 @@ export class World {
       this.scene.add(umb)
     }
     if (b.label) {
-      const m = signMesh(b.label, 1.1, { color: '#fff5e6', bg: 'rgba(120,50,10,0.85)', size: 60, pad: 12 })
+      const m = this.signText(b.label, b.labelEn ?? b.label, 1.1, { color: '#fff5e6', bg: 'rgba(120,50,10,0.85)', size: 60, pad: 12 })
       m.position.set(b.x, b.h - 0.6, b.z + front * (b.d / 2 + 0.12))
       if (front < 0) m.rotation.y = Math.PI
       this.scene.add(m)
@@ -451,7 +743,7 @@ export class World {
     this.box(st.x, 0, st.z - 3.3, 14.6, 0.3, 0.6, this.mats.white, true, false)
     this.box(st.x, 0, st.z + 3.3, 14.6, 0.3, 0.6, this.mats.white, true, false)
     for (let i = -2; i <= 2; i += 1) this.box(st.x + i * 3, 0, st.z + 5.2, 0.9, 0.45, 2, this.mats.white, false)
-    const m = signMesh('科学园会所 · 回血', 1.5, { color: '#ffffff', bg: 'rgba(20,120,80,0.9)', size: 64, pad: 12 })
+    const m = this.signText('科学园会所 · 回血', 'Clubhouse · Heal', 1.5, { color: '#ffffff', bg: 'rgba(20,120,80,0.9)', size: 64, pad: 12 })
     m.position.set(b.x, b.h - 1.4, b.z - b.d / 2 - 0.1)
     m.rotation.y = Math.PI
     this.scene.add(m)
@@ -494,7 +786,7 @@ export class World {
     this.box(x - 3.5, h, pz - 1, 1.2, 1.1, 0.6, this.mats.crate)
     this.box(x + 3.5, h, pz - 1, 1.2, 1.1, 0.6, this.mats.crate)
     if (b.label) this.sign(b, b.label, h - 2, side < 0 ? 'e' : 'w', 2)
-    const bridgeSign = signMesh('连桥 · 金蛋观测台', 0.8, { color: '#eafffb', bg: 'rgba(10,40,50,0.85)', size: 48, pad: 10 })
+    const bridgeSign = this.signText('连桥 · 金蛋观测台', 'Sky bridge · Egg overlook', 0.8, { color: '#eafffb', bg: 'rgba(10,40,50,0.85)', size: 48, pad: 10 })
     bridgeSign.position.set(x, h + 1.7, z0 + 0.4)
     this.scene.add(bridgeSign)
     // Drone pad.
@@ -503,12 +795,11 @@ export class World {
     disc.rotation.x = -Math.PI / 2
     disc.position.set(pad.x, pad.y + 0.03, pad.z)
     this.scene.add(disc)
-    const icon = new THREE.Sprite(new THREE.SpriteMaterial({ map: badgeTexture('无人机', '#7ef9ff'), depthTest: true, toneMapped: false }))
-    icon.scale.set(1.6, 1.6, 1)
+    const icon = this.badge('无人机', 'UAV', '#7ef9ff', 1.6)
     icon.position.set(pad.x, pad.y + 3.4, pad.z)
     this.scene.add(icon)
     this.padIcons.push(icon)
-    const stairSign = labelSprite('↑ 屋顶无人机坪', 0.7, { color: '#7ef9ff', bg: 'rgba(5,20,30,0.85)', size: 44, pad: 10 })
+    const stairSign = this.label('↑ 屋顶无人机坪', '↑ Rooftop drone pad', 0.7, { color: '#7ef9ff', bg: 'rgba(5,20,30,0.85)', size: 44, pad: 10 })
     stairSign.position.set(sx, 2.4, z + d / 2 + 1)
     this.scene.add(stairSign)
   }
@@ -540,10 +831,12 @@ export class World {
     ring.rotation.x = Math.PI / 2
     ring.position.set(EGG.x, EGG.cy - EGG.ry * 0.38, EGG.z)
     this.scene.add(ring)
-    const glassTube = this.box(EGG.x, 0, EGG.z - EGG.rz - 1.2, 3.2, EGG.cy - 5, 3.2, this.mats.glass)
-    glassTube.castShadow = false
-    this.cover(EGG.x, EGG.z, [[-9, 5, 0], [9, -5, 0], [-4.5, -9.5, 1], [3, 9.5, 1], [-11, -2, 2], [11, 2, 2]])
-    const title = labelSprite('金蛋 · 高锟会议中心', 2.2, { color: '#ffe7a3', stroke: 'rgba(40,20,0,0.8)', size: 64, pad: 12 })
+    const rim: [number, number, number][] = [0, 50, 130, 180, 230, 310].map((deg, i) => {
+      const a = (deg * Math.PI) / 180
+      return [Math.cos(a) * 15.2, Math.sin(a) * 15.2, i % 3] as [number, number, number]
+    })
+    this.cover(EGG.x, EGG.z, rim)
+    const title = this.label('金蛋 · 高锟会议中心', 'Golden Egg · Charles Kao Auditorium', 2.2, { color: '#ffe7a3', stroke: 'rgba(40,20,0,0.8)', size: 64, pad: 12 })
     title.position.set(EGG.x, EGG.cy + EGG.ry + 3.2, EGG.z)
     this.scene.add(title)
   }
@@ -570,7 +863,7 @@ export class World {
         this.box(base.x + s * 13, 0, base.z + dz, 0.2, 7, 0.2, this.mats.dark, false)
         this.box(base.x + s * 13 - s * 1.1, 4.4, base.z + dz, 2.2, 2.4, 0.08, teamMat, false)
       }
-      const label = labelSprite(base.team === 0 ? '红方部署区' : '蓝方部署区', 1.6, { color: '#fff', bg: TEAM_CSS[base.team], size: 48, pad: 14 })
+      const label = this.label(base.team === 0 ? '红方部署区' : '蓝方部署区', base.team === 0 ? 'Red deployment' : 'Blue deployment', 1.6, { color: '#fff', bg: TEAM_CSS[base.team], size: 48, pad: 14 })
       label.position.set(base.x, 5, base.z)
       this.scene.add(label)
       // Helipad.
@@ -584,8 +877,7 @@ export class World {
         const a = (i / 8) * Math.PI * 2
         this.box(hp.x + Math.cos(a) * (hp.r + 1.9), 0, hp.z + Math.sin(a) * (hp.r + 1.9), 0.3, 0.25, 0.3, this.mats.ledWarm, false, false)
       }
-      const icon = new THREE.Sprite(new THREE.SpriteMaterial({ map: badgeTexture('直升机', TEAM_CSS[base.team]), toneMapped: false }))
-      icon.scale.set(1.8, 1.8, 1)
+      const icon = this.badge('直升机', 'HELI', TEAM_CSS[base.team], 1.8)
       icon.position.set(hp.x - s * (hp.r + 3), 3, hp.z)
       this.scene.add(icon)
       this.padIcons.push(icon)
@@ -601,7 +893,8 @@ export class World {
       STATIONS.some(s => Math.hypot(x - s.x, z - s.z) < s.r + 3) ||
       BASES.some(b => Math.hypot(x - b.x, z - b.z) < 16) ||
       HELIPADS.some(h => Math.hypot(x - h.x, z - h.z) < 11) ||
-      Math.hypot(x, z) < 24
+      Math.hypot(x, z) < 24 ||
+      (Math.abs(x) < 9 && z < -6)
     for (const r of ROADS) {
       const len = Math.hypot(r.x1 - r.x0, r.z1 - r.z0)
       const ux = (r.x1 - r.x0) / len, uz = (r.z1 - r.z0) / len
@@ -645,21 +938,23 @@ export class World {
   // ─── dynamic markers ────────────────────────────────────────────────────
   private pointVisuals(): void {
     for (const p of POINTS) {
+      const gy = p.kind === 'island' ? ISLAND.y : 0
       const ring = new THREE.Mesh(new THREE.RingGeometry(p.r - 0.35, p.r, 64), new THREE.MeshBasicMaterial({ color: NEUTRAL, toneMapped: false, transparent: true, opacity: 0.9, side: THREE.DoubleSide }))
       ring.rotation.x = -Math.PI / 2
-      ring.position.set(p.x, 0.06, p.z)
+      ring.position.set(p.x, gy + 0.06, p.z)
       const disk = new THREE.Mesh(new THREE.CircleGeometry(p.r - 0.35, 64), new THREE.MeshBasicMaterial({ color: NEUTRAL, transparent: true, opacity: 0.08, depthWrite: false }))
       disk.rotation.x = -Math.PI / 2
-      disk.position.set(p.x, 0.05, p.z)
+      disk.position.set(p.x, gy + 0.05, p.z)
       const beam = new THREE.Mesh(new THREE.CylinderGeometry(p.r, p.r, 2.4, 48, 1, true), new THREE.MeshBasicMaterial({ color: NEUTRAL, transparent: true, opacity: 0.1, side: THREE.DoubleSide, depthWrite: false, toneMapped: false }))
-      beam.position.set(p.x, 1.2, p.z)
-      const badgeTex = [badgeTexture(p.short, '#e8edf2'), badgeTexture(p.short, TEAM_CSS[0]), badgeTexture(p.short, TEAM_CSS[1])]
+      beam.position.set(p.x, gy + 1.2, p.z)
+      const badgeTex = [badgeTexture(pointShort(p), '#e8edf2'), badgeTexture(pointShort(p), TEAM_CSS[0]), badgeTexture(pointShort(p), TEAM_CSS[1])]
       const badge = new THREE.Sprite(new THREE.SpriteMaterial({ map: badgeTex[0], toneMapped: false }))
       const b = BUILDINGS.find(bb => bb.id === p.id)
-      const y = p.kind === 'egg' ? EGG.cy + EGG.ry + 6.5 : b && b.style === 'hall' ? b.h + 3.5 : 3.6
+      const y = p.kind === 'egg' ? EGG.cy + EGG.ry + 6.5 : b && b.style === 'hall' ? b.h + 3.5 : p.kind === 'island' ? gy + 11 : gy + 3.6
       badge.position.set(p.x, y, p.z)
       badge.scale.setScalar(p.kind === 'egg' ? 3.6 : 2.2)
       this.scene.add(ring, disk, beam, badge)
+      if (p.kind === 'island') this.seaOnly.push(ring, disk, beam, badge)
       this.points.push({ ring, disk, beam, badge, badgeTex })
     }
   }
@@ -667,12 +962,11 @@ export class World {
   private stationVisuals(): void {
     for (const s of STATIONS) {
       const color = s.kind === 'supply' ? '#ffa94d' : s.kind === 'heal' ? '#5cff9d' : SKILLS[s.skill!].color
-      const glyph = s.kind === 'supply' ? '补给' : s.kind === 'heal' ? '回血' : '技能'
+      const glyph = s.kind === 'supply' ? ['补给', 'AMMO'] : s.kind === 'heal' ? ['回血', 'HEAL'] : ['技能', 'SKILL']
       const ring = new THREE.Mesh(new THREE.RingGeometry(s.r - 0.25, s.r, 48), new THREE.MeshBasicMaterial({ color, toneMapped: false, transparent: true, opacity: 0.85, side: THREE.DoubleSide }))
       ring.rotation.x = -Math.PI / 2
       ring.position.set(s.x, 0.07, s.z)
-      const icon = new THREE.Sprite(new THREE.SpriteMaterial({ map: badgeTexture(glyph, color), toneMapped: false, transparent: true }))
-      icon.scale.setScalar(1.5)
+      const icon = this.badge(glyph[0], glyph[1], color, 1.5)
       const baseY = s.kind === 'heal' ? 3.2 : 2.6
       icon.position.set(s.x, baseY, s.z)
       this.scene.add(ring, icon)
@@ -682,6 +976,7 @@ export class World {
 
   setPointOwner(i: number, owner: number, capturing: number, contested: boolean, t: number): void {
     const v = this.points[i]
+    this.pointOwners[i] = owner
     const col = owner >= 0 ? TEAM_COLORS[owner] : NEUTRAL
     const pulse = capturing >= 0 && capturing !== owner ? 0.5 + 0.5 * Math.sin(t * 8) : 1
     const shown = contested ? (Math.sin(t * 10) > 0 ? 0xffd35c : col) : capturing >= 0 && capturing !== owner && pulse > 0.5 ? TEAM_COLORS[capturing] : col

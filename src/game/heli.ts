@@ -1,4 +1,5 @@
 import * as THREE from 'three'
+import { L } from './i18n'
 import type { Collision } from './collide'
 import { CONFIG, TEAM_COLORS } from './config'
 import { HELIPADS } from './map'
@@ -44,12 +45,13 @@ export class Heli {
   private gunCd = 0
   private rotorSpeed = 0
   private spin = 0
-  readonly name: string
+  get name(): string {
+    return this.team === 0 ? L('红方直升机 “赤隼”', 'Red helicopter “Falcon”') : L('蓝方直升机 “海鹞”', 'Blue helicopter “Harrier”')
+  }
   readonly pad: { x: number; z: number }
 
   constructor(readonly team: number, scene: THREE.Scene) {
     this.pad = HELIPADS[team]
-    this.name = team === 0 ? '红方直升机 “赤隼”' : '蓝方直升机 “海鹞”'
     const color = TEAM_COLORS[team]
     const m = (c: number, o: Partial<THREE.MeshStandardMaterialParameters> = {}) => new THREE.MeshStandardMaterial({ color: c, roughness: 0.5, metalness: 0.35, ...o })
     const hull = m(0x46525c)

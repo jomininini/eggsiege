@@ -17,6 +17,12 @@ describe('save', () => {
     expect(s.wins).toBe(0)
     expect(s.bestKills).toBe(12)
   })
+  it('validates match options and language', () => {
+    const s = parseSave(JSON.stringify({ version: 3, lang: 'en', mode: 'sea', perTeam: 9, difficulty: 'elite' }))
+    expect([s.lang, s.mode, s.perTeam, s.difficulty]).toEqual(['en', 'sea', 9, 'elite'])
+    const bad = parseSave(JSON.stringify({ version: 3, lang: 'fr', mode: 'air', perTeam: 40, difficulty: 'god' }))
+    expect([bad.lang, bad.mode, bad.perTeam, bad.difficulty]).toEqual(['zh', 'standard', 6, 'normal'])
+  })
   it('persists updates and survives storage failures', () => {
     const mem = new Map<string, string>()
     const store = new SaveStore({ getItem: k => mem.get(k) ?? null, setItem: (k, v) => void mem.set(k, v) })

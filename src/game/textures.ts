@@ -155,7 +155,13 @@ export function badgeTexture(glyph: string, color: string, ring = '#0b1420'): TH
   g.lineWidth = 8
   g.strokeStyle = color
   g.stroke()
-  g.font = `900 ${glyph.length > 1 ? 44 : 62}px ${FONT}`
+  let fs = glyph.length > 1 ? 44 : 62
+  g.font = `900 ${fs}px ${FONT}`
+  const tw = g.measureText(glyph).width
+  if (tw > 100) {
+    fs = Math.floor((fs * 100) / tw)
+    g.font = `900 ${fs}px ${FONT}`
+  }
   g.textAlign = 'center'
   g.textBaseline = 'middle'
   g.fillStyle = color

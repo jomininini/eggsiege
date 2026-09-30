@@ -2,16 +2,20 @@ import * as THREE from 'three'
 import type { Input } from '../engine/input'
 import type { Collision } from './collide'
 import { CONFIG, PLAYER_TEAM } from './config'
-import { LAND, SEA, SHORE_Z, type SkillId } from './map'
+import { L } from './i18n'
+import { isWater, LAND, SEA, type SkillId } from './map'
 import type { Unit } from './units'
 
-export type PlayerMode = 'foot' | 'vehicle' | 'drone' | 'heli' | 'dead'
+export type PlayerMode = 'foot' | 'vehicle' | 'drone' | 'heli' | 'aa' | 'arty' | 'dead'
+export type WeaponSlot = 'rifle' | 'launcher'
 
 /** The local player: FPS movement, weapon state, buffs and stats. */
 export class Player implements Unit {
   readonly id = 1
   readonly isPlayer = true
-  readonly name = '你'
+  get name(): string {
+    return L('你', 'You')
+  }
   readonly team = PLAYER_TEAM
   readonly pos = new THREE.Vector3()
   readonly prev = new THREE.Vector3()
@@ -51,8 +55,15 @@ export class Player implements Unit {
   damageDealt = 0
   buffs: Record<SkillId, number> = { scan: 0, shield: 0, steady: 0, rush: 0 }
   ads = 0
+  /** Active weapon: KT-9 rifle or the Flyfish-2 guided missile launcher. */
+  weapon: WeaponSlot = 'rifle'
+  rocket = 1
+  rocketReserve: number = CONFIG.launcher.reserve
+  rocketReloadUntil = 0
+  switchUntil = 0
+  lockT = 0
+  lockTarget: unknown = null
   private stepTimer = 0
-
   reset(x: number, z: number, yaw: number, time: number): void {
     this.pos.set(x, 0, z)
     this.prev.copy(this.pos)
@@ -71,6 +82,13 @@ export class Player implements Unit {
     this.reloadUntil = 0
     this.bloom = 0
     this.crouch = false
+    this.weapon = 'rifle'
+    this.rocket = 1
+    this.rocketReserve = Math.max(this.rocketReserve, CONFIG.launcher.reserve)
+    this.rocketReloadUntil = 0
+    this.switchUntil = 0
+    this.lockT = 0
+    this.lockTarget = null
     this.spawnShieldUntil = time + CONFIG.player.spawnShield
     for (const k of Object.keys(this.buffs) as SkillId[]) this.buffs[k] = 0
   }
@@ -78,12 +96,29 @@ export class Player implements Unit {
   resetStats(): void {
     this.kills = this.deaths = this.captures = this.shots = this.hits = this.headshots = this.damageDealt = 0
     this.grenades = CONFIG.grenade.start
+    this.rocketReserve = CONFIG.launcher.reserve
   }
-
   get reloading(): boolean {
-    return this.reloadUntil > 0
+    return this.weapon === 'launcher' ? this.rocketReloadUntil > 0 : this.reloadUntil > 0
   }
 
+  /** Swap between rifle and launcher (cancels a rifle reload). */
+  switchWeapon(to: WeaponSlot, time: number): boolean {
+    if (to === this.weapon) return false
+    this.weapon = to
+    this.reloadUntil = 0
+    this.switchUntil = time + 0.45
+    this.lockT = 0
+    this.lockTarget = null
+    if (to === 'launcher' && this.rocket === 0 && this.rocketReserve > 0 && this.rocketReloadUntil === 0) this.rocketReloadUntil = time + CONFIG.launcher.reload
+    return true
+  }
+
+  startRocketReload(time: number): boolean {
+    if (this.rocket > 0 || this.rocketReserve <= 0 || this.rocketReloadUntil > 0) return false
+    this.rocketReloadUntil = time + CONFIG.launcher.reload
+    return true
+  }
   buff(id: SkillId, time: number): boolean {
     return this.buffs[id] > time
   }
@@ -149,7 +184,7 @@ export class Player implements Unit {
       this.vel.y = 0
     } else this.onGround = false
     const wasWading = this.wading
-    this.wading = this.pos.z < SHORE_Z && this.pos.y < -0.8
+    this.wading = isWater(this.pos.x, this.pos.z) && this.pos.y < -0.8
     if (this.wading && !wasWading) event = 'splash'
     const targetEye = this.crouch ? cfg.crouchEye : cfg.eye
     this.eyeY += (targetEye - this.eyeY) * Math.min(1, dt * 12)
@@ -164,6 +199,14 @@ export class Player implements Unit {
     this.kick -= this.kick * Math.min(1, dt * w.recoilRecover)
     this.kickYaw -= this.kickYaw * Math.min(1, dt * w.recoilRecover)
     this.bloom = Math.max(0, this.bloom - dt * 0.12)
+    if (this.rocketReloadUntil > 0 && time >= this.rocketReloadUntil) {
+      this.rocketReloadUntil = 0
+      if (this.rocketReserve > 0 && this.rocket === 0) {
+        this.rocket = 1
+        this.rocketReserve -= 1
+        return true
+      }
+    }
     if (this.reloadUntil > 0 && time >= this.reloadUntil) {
       const need = w.mag - this.mag
       const take = Math.min(need, this.reserve)
@@ -218,6 +261,10 @@ export class Player implements Unit {
 export class ViewModel {
   readonly group = new THREE.Group()
   private readonly gun = new THREE.Group()
+  private readonly tube = new THREE.Group()
+  private readonly lockLamp: THREE.MeshBasicMaterial
+  private swapT = 0
+  private shown: 'rifle' | 'launcher' = 'rifle'
   private readonly flash: THREE.Sprite
   private readonly mag: THREE.Mesh
   private flashT = 0
@@ -280,9 +327,43 @@ export class ViewModel {
       o.frustumCulled = false
     })
     this.group.add(this.gun)
+    // Flyfish-2 shoulder launcher.
+    const olive = m(0x56624a, { metalness: 0.2, roughness: 0.7 })
+    const tubeMesh = new THREE.Mesh(new THREE.CylinderGeometry(0.075, 0.075, 1.05, 12), olive)
+    tubeMesh.rotation.x = Math.PI / 2
+    tubeMesh.position.set(0, 0.02, -0.2)
+    this.tube.add(tubeMesh)
+    for (const z of [-0.72, 0.33]) {
+      const ring = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.09, 0.08, 12), dark)
+      ring.rotation.x = Math.PI / 2
+      ring.position.set(0, 0.02, z)
+      this.tube.add(ring)
+    }
+    const sight = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.07, 0.16), dark)
+    sight.position.set(-0.1, 0.07, -0.25)
+    this.tube.add(sight)
+    this.lockLamp = new THREE.MeshBasicMaterial({ color: 0x3ff5d8, toneMapped: false })
+    const lamp = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.02, 0.05), this.lockLamp)
+    lamp.position.set(-0.1, 0.115, -0.25)
+    this.tube.add(lamp)
+    const grip = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.12, 0.06), dark)
+    grip.position.set(0, -0.08, -0.35)
+    this.tube.add(grip)
+    const hand = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.07, 0.1), glove)
+    hand.position.set(0, -0.12, -0.35)
+    this.tube.add(hand)
+    this.tube.traverse(o => {
+      o.frustumCulled = false
+    })
+    this.tube.visible = false
+    this.group.add(this.tube)
     this.group.scale.setScalar(0.34)
   }
 
+  /** Tint the launcher sight lamp: 0 = searching, 0..1 locking, 1 = locked. */
+  setLock(k: number): void {
+    this.lockLamp.color.setHex(k >= 1 ? 0xff3355 : k > 0 ? 0xffd35c : 0x3ff5d8)
+  }
   fire(): void {
     this.flashT = 0.045
     this.kickT = 1
@@ -297,6 +378,13 @@ export class ViewModel {
   update(dt: number, p: Player, lookDx: number, lookDy: number, time: number, visible: boolean): void {
     this.group.visible = visible
     if (!visible) return
+    if (this.shown !== p.weapon) {
+      this.shown = p.weapon
+      this.swapT = 1
+      this.gun.visible = p.weapon === 'rifle'
+      this.tube.visible = p.weapon === 'launcher'
+    }
+    this.swapT = Math.max(0, this.swapT - dt * 3)
     const ads = p.ads
     const speed = Math.min(1, p.speed / CONFIG.player.sprint)
     const bob = p.bobPhase * 1.6
@@ -326,6 +414,15 @@ export class ViewModel {
       rz += dip * 0.5
       this.mag.position.y = -0.13 - (k > 0.2 && k < 0.6 ? 0.25 : 0)
     } else this.mag.position.y = -0.13
+    if (p.weapon === 'launcher') {
+      pos.set(0.12 - ads * 0.08, -0.06 + ads * 0.025, -0.16)
+      if (p.rocketReloadUntil > 0) {
+        const k = 1 - Math.max(0, (p.rocketReloadUntil - time) / CONFIG.launcher.reload)
+        pos.y -= Math.sin(Math.min(1, k) * Math.PI) * 0.06
+      }
+    }
+    pos.y -= this.swapT * 0.08
+    this.tube.rotation.x = this.gun.rotation.x * 0.5
     this.group.position.lerp(pos, Math.min(1, dt * 18))
     this.gun.rotation.x += (rx - this.gun.rotation.x) * Math.min(1, dt * 14)
     this.gun.rotation.z += (rz - this.gun.rotation.z) * Math.min(1, dt * 10)

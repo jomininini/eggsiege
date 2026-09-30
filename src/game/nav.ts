@@ -1,16 +1,22 @@
 import type { Box } from './collide'
-import { LAND } from './map'
+import { ISLAND, isWater, LAND } from './map'
 
-/** Ground-level navigation grid for bots: A* over 1.5 m cells, blocked by building footprints. */
+/**
+ * Ground-level navigation grid for bots: A* over 1.5 m cells, blocked by building footprints and
+ * open water (unless a deck — pier, jetty, bridge — covers it). Covers the park and 出海岛; the two
+ * are separate connected regions, crossed only by boat.
+ */
 export type P2 = { x: number; z: number }
 
 export class NavGrid {
   readonly cell = 1.5
   readonly minX = LAND.minX + 1
-  readonly minZ = LAND.minZ + 1
+  readonly minZ = ISLAND.z - ISLAND.rz - 3
   readonly w: number
   readonly h: number
   readonly blocked: Uint8Array
+  /** Connected-component id per free cell (0 = blocked). */
+  readonly region: Int32Array
   private g: Float32Array
   private f: Float32Array
   private from: Int32Array
@@ -28,7 +34,19 @@ export class NavGrid {
     this.from = new Int32Array(n)
     this.stamp = new Uint32Array(n)
     this.closed = new Uint32Array(n)
+    this.region = new Int32Array(n)
+    const decks = boxes.filter(b => b.tag === 'deck')
+    for (let z = 0; z < this.h; z += 1) for (let x = 0; x < this.w; x += 1) {
+      const cx = this.minX + (x + 0.5) * this.cell, cz = this.minZ + (z + 0.5) * this.cell
+      if (!isWater(cx, cz)) continue
+      // Decks count along their full length (plus a little past the ends so they join the shore).
+      const onDeck = decks.some(b =>
+        (cx > b.minX + 0.3 && cx < b.maxX - 0.3 && cz > b.minZ - 0.8 && cz < b.maxZ + 0.8) ||
+        (cz > b.minZ + 0.3 && cz < b.maxZ - 0.3 && cx > b.minX - 0.8 && cx < b.maxX + 0.8))
+      if (!onDeck) this.blocked[z * this.w + x] = 1
+    }
     for (const b of boxes) {
+      if (b.tag === 'deck') continue
       if (b.minY > 1.7 || b.maxY < 0.45) continue
       const x0 = Math.max(0, Math.floor((b.minX - inflate - this.minX) / this.cell))
       const x1 = Math.min(this.w - 1, Math.floor((b.maxX + inflate - this.minX) / this.cell))
@@ -39,6 +57,40 @@ export class NavGrid {
         if (cx > b.minX - inflate && cx < b.maxX + inflate && cz > b.minZ - inflate && cz < b.maxZ + inflate) this.blocked[z * this.w + x] = 1
       }
     }
+    this.label()
+  }
+
+  private label(): void {
+    let id = 0
+    const stack: number[] = []
+    for (let i = 0; i < this.region.length; i += 1) {
+      if (this.blocked[i] || this.region[i]) continue
+      id += 1
+      this.region[i] = id
+      stack.push(i)
+      while (stack.length) {
+        const c = stack.pop()!
+        const cx = c % this.w, cz = Math.floor(c / this.w)
+        for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+          const x = cx + dx, z = cz + dz
+          if (x < 0 || z < 0 || x >= this.w || z >= this.h) continue
+          const j = z * this.w + x
+          if (this.blocked[j] || this.region[j]) continue
+          this.region[j] = id
+          stack.push(j)
+        }
+      }
+    }
+  }
+
+  /** Region id of the nearest walkable cell to (x, z). */
+  regionAt(x: number, z: number): number {
+    return this.region[this.nearestFree(this.toCell(x, z))]
+  }
+
+  /** Can a walker at (ax, az) reach (bx, bz) without a boat? */
+  connected(ax: number, az: number, bx: number, bz: number): boolean {
+    return this.regionAt(ax, az) === this.regionAt(bx, bz)
   }
 
   toCell(x: number, z: number): number {
@@ -84,6 +136,7 @@ export class NavGrid {
     const start = this.nearestFree(this.toCell(sx, sz))
     const goal = this.nearestFree(this.toCell(tx, tz))
     const end = this.center(goal)
+    if (this.region[start] !== this.region[goal]) return []
     if (this.clear({ x: sx, z: sz }, end)) return [end]
     const run = (this.run += 1)
     const heap = new Heap(this.f)

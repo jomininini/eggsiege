@@ -1,12 +1,12 @@
 import * as THREE from 'three'
-import { CONFIG } from './config'
-import { DRONE_PADS, LAND, SEA } from './map'
+import { CONFIG, TEAM_COLORS } from './config'
+import { BASES, DRONE_PADS, LAND, SEA } from './map'
 import type { Unit } from './units'
 
-function quadcopter(): THREE.Group {
+export function quadcopter(led = 0x7ef9ff): THREE.Group {
   const g = new THREE.Group()
   const dark = new THREE.MeshStandardMaterial({ color: 0x20262c, roughness: 0.5, metalness: 0.4 })
-  const glow = new THREE.MeshBasicMaterial({ color: 0x7ef9ff, toneMapped: false })
+  const glow = new THREE.MeshBasicMaterial({ color: led, toneMapped: false })
   const body = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.18, 0.6), dark)
   g.add(body)
   const eye = new THREE.Mesh(new THREE.SphereGeometry(0.1, 8, 6), glow)
@@ -40,6 +40,8 @@ export class Drone {
   readyAt = 0
   yaw = 0
   marked = 0
+  hp: number = CONFIG.drone.hp
+  readonly team = 0
   private nextScan = 0
   private readonly parked: THREE.Group[] = []
   private readonly flyer: THREE.Group
@@ -65,6 +67,7 @@ export class Drone {
     this.prev.copy(this.pos)
     this.yaw = yaw
     this.marked = 0
+    this.hp = CONFIG.drone.hp
     this.parked[pad].visible = false
     this.flyer.visible = true
   }
@@ -112,5 +115,102 @@ export class Drone {
       this.flyer.position.y += Math.sin(t * 3) * 0.1
       this.flyer.rotation.y = this.yaw
     }
+  }
+}
+
+/**
+ * AI reconnaissance drone: each team periodically launches one from its base; it orbits a contested
+ * point at altitude and marks enemies. It can be shot down by rifles, missiles and the island AA.
+ */
+export class ScoutDrone {
+  readonly pos = new THREE.Vector3()
+  readonly prev = new THREE.Vector3()
+  active = false
+  hp = 0
+  nextAt: number = CONFIG.scout.first
+  until = 0
+  cx = 0
+  cz = 0
+  private ang = Math.random() * 6
+  private arrived = false
+  private nextScan = 0
+  readonly mesh: THREE.Group
+  constructor(readonly team: number, scene: THREE.Scene) {
+    this.mesh = quadcopter(TEAM_COLORS[team])
+    this.mesh.scale.setScalar(1.8)
+    this.mesh.visible = false
+    scene.add(this.mesh)
+  }
+  get center(): THREE.Vector3 {
+    return this.pos
+  }
+  reset(): void {
+    this.active = false
+    this.mesh.visible = false
+    this.nextAt = CONFIG.scout.first + this.team * 12
+  }
+  launch(t: number, x: number, z: number): void {
+    const b = BASES[this.team]
+    this.active = true
+    this.arrived = false
+    this.hp = CONFIG.scout.hp
+    this.until = t + CONFIG.scout.duration + 8
+    this.cx = x
+    this.cz = z
+    this.pos.set(b.x, 6, b.z)
+    this.prev.copy(this.pos)
+    this.mesh.visible = true
+  }
+  down(t: number): void {
+    this.active = false
+    this.mesh.visible = false
+    this.nextAt = t + CONFIG.scout.interval
+  }
+  /** Returns true once when it arrives over its target. */
+  step(dt: number, t: number, enemies: { pos: THREE.Vector3; alive: boolean; spottedUntil: number }[], mark: boolean): boolean {
+    this.prev.copy(this.pos)
+    if (!this.active) return false
+    if (t >= this.until) {
+      this.down(t)
+      return false
+    }
+    const cfg = CONFIG.scout
+    let arrivedNow = false
+    let tx: number, tz: number
+    if (!this.arrived) {
+      tx = this.cx
+      tz = this.cz
+      if (Math.hypot(this.pos.x - tx, this.pos.z - tz) < cfg.radius + 2) {
+        this.arrived = true
+        arrivedNow = true
+      }
+    } else {
+      this.ang += dt * 0.35
+      tx = this.cx + Math.cos(this.ang) * cfg.radius
+      tz = this.cz + Math.sin(this.ang) * cfg.radius
+    }
+    const dx = tx - this.pos.x, dz = tz - this.pos.z
+    const d = Math.hypot(dx, dz) || 1
+    const sp = Math.min(22, d * 3)
+    this.pos.x += (dx / d) * sp * dt
+    this.pos.z += (dz / d) * sp * dt
+    this.pos.y += (cfg.height - this.pos.y) * Math.min(1, dt * 0.8)
+    if (mark && this.arrived && t >= this.nextScan) {
+      this.nextScan = t + 0.5
+      for (const u of enemies) {
+        if (!u.alive) continue
+        if (Math.hypot(u.pos.x - this.pos.x, u.pos.z - this.pos.z) < cfg.markRadius) u.spottedUntil = Math.max(u.spottedUntil, t + 4)
+      }
+    }
+    return arrivedNow
+  }
+  render(alpha: number, dt: number, t: number): void {
+    if (!this.active) return
+    this.mesh.position.lerpVectors(this.prev, this.pos, alpha)
+    this.mesh.position.y += Math.sin(t * 2.4 + this.team) * 0.2
+    this.mesh.rotation.y = this.ang + Math.PI / 2
+    this.mesh.children.forEach(c => {
+      if (c.name === 'prop') c.rotation.y += dt * 60
+    })
   }
 }

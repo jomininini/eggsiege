@@ -4,13 +4,16 @@
  */
 export type Action =
   | 'jump' | 'sprint' | 'crouch' | 'reload' | 'interact' | 'grenade' | 'fire' | 'aim' | 'pause' | 'score'
-  | 'n1' | 'n2' | 'n3' | 'n4' | 'n5'
+  | 'n1' | 'n2' | 'n3' | 'n4' | 'n5' | 'swap' | 'mode' | 'strike'
 const KEY_BINDINGS: Partial<Record<Action, string[]>> = {
   jump: ['Space'],
   sprint: ['ShiftLeft', 'ShiftRight'],
   crouch: ['ControlLeft', 'KeyC'],
   reload: ['KeyR'],
-  interact: ['KeyE', 'KeyF'],
+  interact: ['KeyE'],
+  swap: ['KeyQ'],
+  mode: ['KeyF'],
+  strike: ['KeyB'],
   grenade: ['KeyG'],
   pause: ['KeyP'],
   score: ['Tab'],
@@ -70,6 +73,8 @@ export class Input {
     })
     on(window, 'mousemove', e => {
       if (!this.captured()) return
+      // Browsers occasionally report a huge bogus delta (pointer-lock entry, focus changes): skip it.
+      if (Math.abs(e.movementX) > 280 || Math.abs(e.movementY) > 280) return
       this.look.x += e.movementX * 0.0021
       this.look.y += e.movementY * 0.0021
     })

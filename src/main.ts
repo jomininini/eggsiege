@@ -5,6 +5,7 @@ import { Input } from './engine/input'
 import { GameLoop } from './engine/loop'
 import { SaveStore, type SaveData } from './engine/save'
 import type { Game } from './game/game'
+import { onLang, setLang } from './game/i18n'
 import { Ui } from './ui/ui'
 
 declare global {
@@ -16,6 +17,7 @@ declare global {
 async function boot(): Promise<void> {
   const canvas = document.querySelector<HTMLCanvasElement>('#game')!
   const save = new SaveStore()
+  setLang(save.data.lang)
   const input = new Input(canvas)
   const audio = new Audio()
   let game: Game | undefined
@@ -31,7 +33,7 @@ async function boot(): Promise<void> {
     if (!game) return
     audio.unlock()
     audio.startMusic()
-    game.start()
+    game.start({ mode: save.data.mode, perTeam: save.data.perTeam, difficulty: save.data.difficulty })
     ui.show('hud')
     loop.resetAccumulator()
     input.lockPointer()
@@ -66,6 +68,7 @@ async function boot(): Promise<void> {
       save.update(patch)
       applySettings(save.data)
       if (qualityChanged) renderer?.applyQuality(save.data.quality)
+      if (patch.lang) setLang(patch.lang)
     },
   })
   ui.show('boot')
@@ -82,6 +85,7 @@ async function boot(): Promise<void> {
   renderer = new Renderer(canvas, save.data.quality)
   game = new Game(renderer, input, audio)
   ui.attach(game)
+  onLang(() => game?.relabel())
   ui.setBootProgress(1)
 
   document.addEventListener('pointerlockchange', () => {
@@ -113,7 +117,7 @@ async function boot(): Promise<void> {
     },
     render: (alpha, frame) => {
       if (!game) return
-      game.render(alpha, frame)
+      if (ui.screen !== 'title' || game.state !== 'title') game.render(alpha, frame)
       ui.update(frame, game.state === 'playing' && input.held('score'))
     },
   })

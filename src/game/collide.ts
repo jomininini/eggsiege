@@ -1,4 +1,4 @@
-import { baseGround, isSea, WATER_Y } from './map'
+import { baseGround, inIsland, ISLAND, isWater, WATER_Y } from './map'
 
 /**
  * Lightweight static collision: every solid is an axis-aligned box. Characters are vertical
@@ -105,20 +105,21 @@ export class Collision {
         best = hit
       }
     }
-    // Ground plane: y = 0 on land, water surface at sea.
+    // Ground plane: y = 0 on land (island top slightly higher), water surface elsewhere.
     if (d.y < -1e-6) {
       const tLand = (0 - o.y) / d.y
       if (tLand > 0 && tLand < tMax) {
         const x = o.x + d.x * tLand, z = o.z + d.z * tLand
-        if (!isSea(x, z)) {
-          tMax = tLand
-          best = { t: tLand, nx: 0, ny: 1, nz: 0, water: false }
+        if (!isWater(x, z)) {
+          const tl = inIsland(x, z) ? (ISLAND.y - o.y) / d.y : tLand
+          tMax = Math.max(0, tl)
+          best = { t: tMax, nx: 0, ny: 1, nz: 0, water: false }
         }
       }
       const tWater = (WATER_Y - o.y) / d.y
       if (tWater > 0 && tWater < tMax) {
-        const z = o.z + d.z * tWater
-        if (isSea(0, z)) best = { t: tWater, nx: 0, ny: 1, nz: 0, water: true }
+        const x = o.x + d.x * tWater, z = o.z + d.z * tWater
+        if (isWater(x, z)) best = { t: tWater, nx: 0, ny: 1, nz: 0, water: true }
       }
     }
     return best

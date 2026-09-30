@@ -4,7 +4,7 @@ import { CONFIG } from './config'
  * Pure match rules: capture progress, team scoring, Golden Egg hold timer and win conditions.
  * Works for any number of teams; the scene reports presence counts and reads the state.
  */
-export type PointKind = 'building' | 'egg'
+export type PointKind = 'building' | 'egg' | 'island'
 export type PointState = {
   kind: PointKind
   /** Owning team, or -1 when neutral. */
@@ -139,7 +139,7 @@ export function tickMatch(state: MatchState, dt: number): MatchEvent | null {
   while (state.tickAcc >= 1) {
     state.tickAcc -= 1
     for (const p of state.points) {
-      if (p.owner >= 0) state.scores[p.owner] += p.kind === 'egg' ? CONFIG.match.tick.egg : CONFIG.match.tick.building
+      if (p.owner >= 0) state.scores[p.owner] += CONFIG.match.tick[p.kind]
     }
   }
   if (eggOwner >= 0 && state.eggHold >= CONFIG.match.eggHoldToWin) return finish(state, eggOwner, 'egg')

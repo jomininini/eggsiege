@@ -5,7 +5,7 @@
 export type Sfx =
   | 'shot' | 'enemyShot' | 'hit' | 'kill' | 'headshot' | 'hurt' | 'reload' | 'empty' | 'explode' | 'capture' | 'lost'
   | 'supply' | 'skill' | 'heal' | 'ui' | 'win' | 'lose' | 'drone' | 'vehicle' | 'heliCall' | 'gun' | 'jump' | 'splash' | 'deny'
-
+  | 'missile' | 'lock' | 'locked' | 'flak' | 'rocket' | 'siren' | 'swap'
 export class Audio {
   readonly ctx: AudioContext
   private master: GainNode
@@ -116,6 +116,22 @@ export class Audio {
       case 'splash': this.burst(0.5, 0.3 * fall, 1200, 0.5, 'highpass'); break
       case 'win': [523, 659, 784, 1047].forEach((f, i) => this.tone(f, f * 1.01, 0.35, 'triangle', 0.25, i * 0.12)); break
       case 'lose': [392, 330, 262, 196].forEach((f, i) => this.tone(f, f * 0.98, 0.4, 'sine', 0.25, i * 0.16)); break
+      case 'missile':
+        this.burst(0.7, 0.5 * fall, 1600, 0.4, 'highpass')
+        this.tone(220, 90, 0.5, 'sawtooth', 0.12 * fall)
+        break
+      case 'lock': this.tone(1200, 1200, 0.04, 'square', 0.06); break
+      case 'locked': this.tone(1800, 1800, 0.12, 'square', 0.09); this.tone(1800, 1800, 0.12, 'square', 0.09, 0.16); break
+      case 'flak':
+        this.burst(0.08, 0.45 * fall, 1300, 0.9)
+        this.tone(140, 70, 0.07, 'square', 0.12 * fall)
+        break
+      case 'rocket':
+        this.burst(0.9, 0.35 * fall, 900, 0.5)
+        this.tone(160, 60, 0.6, 'sawtooth', 0.08 * fall)
+        break
+      case 'siren': [0, 0.45, 0.9].forEach(d => this.tone(600, 1100, 0.4, 'sawtooth', 0.07, d)); break
+      case 'swap': this.tone(500, 420, 0.05, 'square', 0.08); this.tone(760, 760, 0.04, 'square', 0.08, 0.12); break
     }
   }
 

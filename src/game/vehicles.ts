@@ -1,7 +1,8 @@
 import * as THREE from 'three'
 import type { Collision, Vec3 } from './collide'
-import { CONFIG, TEAM_COLORS } from './config'
-import { LAND, SEA, SHORE_Z, WATER_Y } from './map'
+import { CONFIG, NEUTRAL_COLOR, TEAM_COLORS } from './config'
+import { L } from './i18n'
+import { isWater, LAND, SEA, SHORE_Z, WATER_Y } from './map'
 import type { Unit } from './units'
 
 export type VehicleKind = 'car' | 'boat'
@@ -29,15 +30,18 @@ export class Vehicle {
   private bob = Math.random() * 6
   readonly half: { x: number; y: number; z: number }
   readonly radius: number
-  readonly label: string
   private wreck: THREE.Material
-
-  constructor(readonly kind: VehicleKind, readonly team: number, readonly spawn: Spawn, scene: THREE.Scene) {
+  private stripe: THREE.MeshStandardMaterial | null = null
+  /** False when the mode does not use this vehicle (hidden and inert). */
+  enabled = true
+  /** 出海岛 patrol boat: owned by whoever holds the island. */
+  readonly island: boolean
+  constructor(readonly kind: VehicleKind, public team: number, readonly spawn: Spawn, scene: THREE.Scene, island = false) {
+    this.island = island
     const cfg = kind === 'car' ? CONFIG.car : CONFIG.boat
     this.maxHp = this.hp = cfg.hp
     this.radius = cfg.radius
     this.half = kind === 'car' ? { x: 1.25, y: 1.0, z: 2.4 } : { x: 1.5, y: 0.9, z: 3.3 }
-    this.label = kind === 'car' ? '轻型战车' : '登陆快艇'
     this.wreck = new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 1 })
     if (kind === 'car') this.buildCar()
     else this.buildBoat()
@@ -49,6 +53,28 @@ export class Vehicle {
     })
     scene.add(this.mesh)
     this.reset()
+  }
+
+  get label(): string {
+    if (this.kind === 'car') return L('轻型战车', 'light combat vehicle')
+    return this.island ? L('出海岛巡逻艇', 'island patrol boat') : L('登陆快艇', 'assault boat')
+  }
+
+  /** Re-colour the team stripe (island boats change hands with the island). */
+  setTeam(team: number): void {
+    if (team === this.team) return
+    this.team = team
+    const c = team >= 0 ? TEAM_COLORS[team] : NEUTRAL_COLOR
+    if (this.stripe) {
+      this.stripe.color.setHex(c)
+      this.stripe.emissive.setHex(c)
+    }
+  }
+
+  setEnabled(on: boolean): void {
+    this.enabled = on
+    this.mesh.visible = on && this.alive
+    if (!on) this.driver = null
   }
 
   private mat(color: number, opts: Partial<THREE.MeshStandardMaterialParameters> = {}): THREE.MeshStandardMaterial {
@@ -90,9 +116,10 @@ export class Vehicle {
   }
 
   private buildBoat(): void {
-    const team = TEAM_COLORS[this.team]
+    const team = this.team >= 0 ? TEAM_COLORS[this.team] : NEUTRAL_COLOR
     const hullMat = this.mat(0xe9ecef, { roughness: 0.4 })
-    const stripe = this.mat(team, { emissive: team, emissiveIntensity: 0.25 })
+    const stripe = this.mat(team, { emissive: team, emissiveIntensity: this.island ? 0.6 : 0.25 })
+    this.stripe = stripe
     const shape = new THREE.Shape()
     shape.moveTo(-1.5, -3.2)
     shape.lineTo(1.5, -3.2)
@@ -123,7 +150,7 @@ export class Vehicle {
     this.hp = this.maxHp
     this.alive = true
     this.driver = null
-    this.mesh.visible = true
+    this.mesh.visible = this.enabled
     this.mesh.traverse(o => {
       const m = o as THREE.Mesh
       if (m.isMesh && m.userData.mat) m.material = m.userData.mat
@@ -175,15 +202,36 @@ export class Vehicle {
         impact = Math.abs(this.speed)
         this.speed *= 0.45
       }
-      this.pos.y = col.groundAt(this.pos.x, this.pos.z, 1.0, this.pos.y + 0.45)
+      const g = col.groundAt(this.pos.x, this.pos.z, 1.0, this.pos.y + 0.45)
+      if (g < -0.5) {
+        // Never drive into the canal or the lake: bounce back onto the bank.
+        this.pos.x = this.prev.x
+        this.pos.z = this.prev.z
+        impact = Math.abs(this.speed)
+        this.speed *= -0.3
+        this.pos.y = col.groundAt(this.pos.x, this.pos.z, 1.0, this.pos.y + 0.45)
+      } else this.pos.y = g
     } else {
       const p: Vec3 = { x: this.pos.x, y: -1.4, z: this.pos.z }
       const hit = col.pushOut(p, this.radius, 2, 0.2)
-      this.pos.x = Math.max(SEA.minX, Math.min(SEA.maxX, p.x))
-      this.pos.z = Math.max(SEA.minZ, Math.min(SEA.maxZ - this.radius + 1, p.z))
-      if (hit || p.z !== this.pos.z) {
+      p.x = Math.max(SEA.minX, Math.min(SEA.maxX, p.x))
+      p.z = Math.max(SEA.minZ, p.z)
+      // Keep the hull on open water: sea, canal and the egg lake (the island and banks are solid).
+      let blocked = false
+      if (!waterOK(p.x, p.z, this.radius)) {
+        blocked = true
+        if (waterOK(p.x, this.prev.z, this.radius)) p.z = this.prev.z
+        else if (waterOK(this.prev.x, p.z, this.radius)) p.x = this.prev.x
+        else {
+          p.x = this.prev.x
+          p.z = this.prev.z
+        }
+      }
+      this.pos.x = p.x
+      this.pos.z = p.z
+      if (hit || blocked) {
         impact = Math.abs(this.speed)
-        this.speed *= 0.5
+        this.speed *= blocked ? 0.35 : 0.5
       }
       this.bob += dt * 2
       this.pos.y = WATER_Y - 0.25 + Math.sin(this.bob) * 0.08
@@ -224,4 +272,10 @@ export class Vehicle {
     for (const w of this.wheels) w.rotation.x += this.speed * dt / 0.48
     if (aimYaw !== undefined) this.turret.rotation.y = aimYaw - this.mesh.rotation.y
   }
+}
+
+/** Is the whole hull footprint over water? */
+export function waterOK(x: number, z: number, r: number): boolean {
+  const k = r * 0.8
+  return isWater(x, z) && isWater(x + k, z) && isWater(x - k, z) && isWater(x, z + k) && isWater(x, z - k)
 }

@@ -2,8 +2,11 @@
  * Versioned local save: settings plus a small career record. Corrupt data falls back to defaults.
  */
 export type Quality = 'low' | 'medium' | 'high'
+export type Lang = 'zh' | 'en'
+export type Mode = 'standard' | 'sea'
+export type Diff = 'easy' | 'normal' | 'hard' | 'elite'
 export type SaveData = {
-  version: 2
+  version: 3
   musicVolume: number
   sfxVolume: number
   muted: boolean
@@ -13,11 +16,18 @@ export type SaveData = {
   wins: number
   matches: number
   bestKills: number
+  lang: Lang
+  mode: Mode
+  perTeam: number
+  difficulty: Diff
 }
 export const SAVE_KEY = 'eggsiege.save'
 
 export function defaultSave(): SaveData {
-  return { version: 2, musicVolume: 0.5, sfxVolume: 0.8, muted: false, sensitivity: 1, invertY: false, quality: 'high', wins: 0, matches: 0, bestKills: 0 }
+  return {
+    version: 3, musicVolume: 0.5, sfxVolume: 0.8, muted: false, sensitivity: 1, invertY: false, quality: 'high', wins: 0, matches: 0, bestKills: 0,
+    lang: 'zh', mode: 'standard', perTeam: 6, difficulty: 'normal',
+  }
 }
 const clamp01 = (v: unknown, f: number) => (typeof v === 'number' && Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : f)
 const count = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0)
@@ -33,9 +43,9 @@ export function parseSave(raw: string | null): SaveData {
   } catch {
     return base
   }
-  if (d.version !== 2) return base
+  if (d.version !== 2 && d.version !== 3) return base
   return {
-    version: 2,
+    version: 3,
     musicVolume: clamp01(d.musicVolume, base.musicVolume),
     sfxVolume: clamp01(d.sfxVolume, base.sfxVolume),
     muted: d.muted === true,
@@ -45,6 +55,10 @@ export function parseSave(raw: string | null): SaveData {
     wins: count(d.wins),
     matches: count(d.matches),
     bestKills: count(d.bestKills),
+    lang: d.lang === 'en' ? 'en' : 'zh',
+    mode: d.mode === 'sea' ? 'sea' : 'standard',
+    perTeam: typeof d.perTeam === 'number' && d.perTeam >= 2 && d.perTeam <= 10 ? Math.round(d.perTeam) : base.perTeam,
+    difficulty: d.difficulty === 'easy' || d.difficulty === 'hard' || d.difficulty === 'elite' ? d.difficulty : 'normal',
   }
 }
 
