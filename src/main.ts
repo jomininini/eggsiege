@@ -6,11 +6,11 @@ import { GameLoop } from './engine/loop'
 import { SaveStore, type SaveData } from './engine/save'
 import type { Game } from './game/game'
 import { onLang, setLang } from './game/i18n'
+import { Account } from './net/account'
 import { Ui } from './ui/ui'
-
 declare global {
   interface Window {
-    __game?: { game: Game; input: Input; ui: Ui; start(): void; map: typeof import('./game/map') }
+    __game?: { game: Game; input: Input; ui: Ui; account: Account; start(): void; map: typeof import('./game/map') }
   }
 }
 
@@ -64,13 +64,30 @@ async function boot(): Promise<void> {
       input.unlockPointer()
     },
     settings: patch => {
-      const qualityChanged = patch.quality !== undefined && patch.quality !== save.data.quality
-      save.update(patch)
-      applySettings(save.data)
-      if (qualityChanged) renderer?.applyQuality(save.data.quality)
-      if (patch.lang) setLang(patch.lang)
+      applyPatch(patch)
+      account.settingsChanged(patch)
     },
   })
+  const applyPatch = (patch: Partial<SaveData>) => {
+    const qualityChanged = patch.quality !== undefined && patch.quality !== save.data.quality
+    save.update(patch)
+    applySettings(save.data)
+    if (qualityChanged) renderer?.applyQuality(save.data.quality)
+    if (patch.lang) setLang(patch.lang)
+  }
+  // Signed-in players carry their settings across devices: the cloud copy wins on login.
+  const account = new Account(
+    () => save.data,
+    cloud => {
+      const changed = (Object.keys(cloud) as (keyof SaveData)[]).filter(k => cloud[k] !== save.data[k])
+      if (!changed.length) return
+      const langChanged = cloud.lang !== undefined && cloud.lang !== save.data.lang
+      applyPatch(cloud)
+      if (!langChanged) ui.refresh()
+    },
+  )
+  ui.setAccount(account)
+  void account.init()
   ui.show('boot')
   applySettings(save.data)
   ui.setBootProgress(0.1)
@@ -123,7 +140,7 @@ async function boot(): Promise<void> {
   })
   loop.start()
   ui.show('title')
-  window.__game = { game, input, ui, start: startMatch, map: MapData }
+  window.__game = { game, input, ui, account, start: startMatch, map: MapData }
 }
 
 void boot()

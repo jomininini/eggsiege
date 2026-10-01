@@ -65,10 +65,15 @@ try {
   page.on('console', m => m.type() === 'error' && errors.push(m.text()))
   page.on('pageerror', e => errors.push(String(e)))
   page.on('response', r => r.status() >= 400 && errors.push(`HTTP ${r.status()} ${r.url()}`))
+  // The static build has no API here; serve the logged-out session (the account flow itself is
+  // covered by scripts/account-e2e.mjs against the dev server).
+  await page.route(/\/api\/trpc\/webdev\.auth\.me/, r => r.fulfill({ status: 200, contentType: 'application/json', body: '{"result":{"data":{"json":null}}}' }))
   await page.addInitScript(q => { if (q && !localStorage.getItem('eggsiege.save')) localStorage.setItem('eggsiege.save', JSON.stringify({ version: 2, musicVolume: 0.5, sfxVolume: 0.8, muted: false, sensitivity: 1, invertY: false, quality: q, wins: 0, matches: 0, bestKills: 0 })) }, process.env.QUALITY ?? 'low')
   await page.goto(url)
   await page.waitForSelector('.screen.title.on', { timeout: 60_000 })
   await wait(2500)
+  await page.waitForSelector('.acct [data-a=login]', { timeout: 15_000 })
+  log('title: sign-in card shown for logged-out player')
   await page.screenshot({ path: `${out}/01-title.png` })
   const open0 = await page.evaluate(() => !document.querySelector('.brief').classList.contains('mini'))
   if (!open0) throw new Error('briefing should start expanded')
@@ -303,13 +308,15 @@ try {
   const dry = await page.evaluate(() => ({ w: window.__game.game.player.weapon, st: window.__game.game.ammoState, warn: document.querySelector('.ammo-warn')?.className, txt: document.querySelector('.ammo-warn span')?.textContent, toast: document.querySelector('.toasts')?.textContent }))
   log('dry', JSON.stringify(dry))
   if (dry.w !== 'pistol' || dry.st !== 'dry' || !/dry/.test(dry.warn) || !dry.txt) throw new Error('rifle-dry fallback/hint missing: ' + JSON.stringify(dry))
+  const pShots0 = await page.evaluate(() => window.__game.game.player.shots)
   await page.mouse.down()
   await sim(3)
   await page.mouse.up()
   await sim(2)
-  const pst = await page.evaluate(() => ({ pmag: window.__game.game.player.pmag, shots: window.__game.game.player.shots }))
+  const pst = await page.evaluate(s0 => ({ pmag: window.__game.game.player.pmag, fired: window.__game.game.player.shots - s0 }), pShots0)
   log('pistol', JSON.stringify(pst))
-  if (pst.pmag !== 12 && pst.pmag < 6) throw new Error('pistol did not reload: ' + JSON.stringify(pst))
+  // More shots than one 12-round magazine (or a refilled magazine) proves the sidearm reloaded.
+  if (pst.fired <= 12 && pst.pmag !== 12) throw new Error('pistol did not reload: ' + JSON.stringify(pst))
   await page.screenshot({ path: `${out}/18-pistol.png` })
   // Isle ammo depot (player holds the isle).
   await page.evaluate(() => { const { game, map } = window.__game; game.debugTeleport(map.ISLAND_DEPOT.x, map.ISLAND_DEPOT.z, 0) })

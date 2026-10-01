@@ -8,7 +8,7 @@ import {
   STATIONS, type SkillId,
 } from '../game/map'
 import { eggIndex, formatClock } from '../game/rules'
-
+import type { Account, CloudRecord } from '../net/account'
 export type Screen = 'boot' | 'title' | 'hud' | 'pause' | 'end'
 export type UiActions = {
   play(): void
@@ -62,6 +62,17 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls = '', html = ''):
   return e
 }
 
+const RANKS: [string, string][] = [
+  ['列兵', 'Private'], ['上等兵', 'Private 1st Class'], ['下士', 'Corporal'], ['中士', 'Sergeant'], ['上士', 'Staff Sergeant'], ['少尉', 'Second Lieutenant'],
+  ['中尉', 'First Lieutenant'], ['上尉', 'Captain'], ['少校', 'Major'], ['中校', 'Lieutenant Colonel'], ['上校', 'Colonel'], ['将军', 'General'],
+]
+export const rankName = (r: number): string => {
+  const n = RANKS[Math.max(0, Math.min(RANKS.length - 1, r))]
+  return L(n[0], n[1])
+}
+const esc = (s: string): string => s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!)
+const fmtHours = (sec: number): string => (sec >= 3600 ? L(`${(sec / 3600).toFixed(1)} 小时`, `${(sec / 3600).toFixed(1)} h`) : L(`${Math.round(sec / 60)} 分钟`, `${Math.round(sec / 60)} min`))
+
 export class Ui {
   private root = document.querySelector<HTMLDivElement>('#ui')!
   private screens = new Map<Screen, HTMLElement>()
@@ -79,7 +90,7 @@ export class Ui {
   private miniTick = 0
   private bootProgress = 0
   private lastEnd?: MatchResult
-
+  private account?: Account
   constructor(private readonly save: SaveStore, private readonly audio: Audio, private readonly actions: UiActions) {
     this.build()
     onLang(() => this.rebuild())
@@ -94,6 +105,11 @@ export class Ui {
     this.buildHud()
     this.buildPause()
     this.buildEnd()
+  }
+
+  /** Re-render every screen (e.g. after settings arrive from the cloud profile). */
+  refresh(): void {
+    this.rebuild()
   }
 
   /** Language switch: rebuild every screen in place and keep the current one visible. */
@@ -124,6 +140,13 @@ export class Ui {
       },
       stateChange: () => undefined,
     })
+  }
+
+  /** Bind the player account (login, cloud profile, match history). */
+  setAccount(a: Account): void {
+    this.account = a
+    a.onChange(() => this.renderAccount())
+    this.renderAccount()
   }
 
   show(s: Screen): void {
@@ -179,6 +202,7 @@ export class Ui {
     }
     s.innerHTML = `
       <div class="title-shade"></div>
+      <div class="acct panel"></div>
       <div class="brand-en">${getLang() === 'en' ? '<b>GOLDEN EGG SIEGE</b><span>SCIENCE PARK FRONT</span>' : ''}</div>
       <div class="title-wrap">
         <div class="brief panel">
@@ -225,6 +249,7 @@ export class Ui {
           )}</div>
         </div>
       </div>
+      <div class="modal profile-m"><div class="panel wide prof"></div></div>
       <div class="modal settings-m"><div class="panel">${this.settingsHtml()}<div class="btns"><button class="btn primary" data-a="close">${L('完成', 'Done')}</button></div></div></div>`
     const brief = s.querySelector<HTMLElement>('.brief')!
     if (this.briefMin) brief.classList.add('mini')
@@ -271,11 +296,122 @@ export class Ui {
     this.bindLang(s)
     this.bindSettings(s)
     this.updateCareer()
+    this.renderAccount()
   }
 
+  // ─── account ────────────────────────────────────────────────────────────
+  private renderAccount(): void {
+    this.updateCareer()
+    this.renderEndSync()
+    const s = this.screens.get('title')
+    const box = s?.querySelector<HTMLElement>('.acct')
+    if (!s || !box) return
+    const a = this.account
+    const st = a?.status ?? 'checking'
+    let html = ''
+    if (st === 'checking') html = `<div class="acct-msg">${L('正在连接账号服务…', 'Connecting to account service…')}</div>`
+    else if (st === 'offline') html = `<div class="acct-msg"><b>${L('离线模式', 'Offline mode')}</b>${L('账号服务不可用，战绩仅保存在本机。', 'Account service unavailable — records stay on this device.')}</div>`
+    else if (st === 'logged_out')
+      html = `<div class="acct-msg"><b>${L('登录以云端保存', 'Sign in to save to the cloud')}</b>${L('档案、军衔进度与战绩记录跨设备同步。', 'Profile, rank progress and match records sync across devices.')}</div>
+        <button class="btn primary sm" data-a="login">${L('登录', 'Sign in')}</button>`
+    else {
+      const p = a!.profile
+      if (!p) html = `<div class="acct-msg">${a!.error ? L('档案同步失败，稍后重试', 'Profile sync failed — will retry') : L('正在同步云端档案…', 'Syncing cloud profile…')}</div>`
+      else {
+        const pct = p.nextXp ? Math.round(((p.xp - p.rankXp) / (p.nextXp - p.rankXp)) * 100) : 100
+        html = `<div class="acct-id"><i class="rk">${p.rank + 1}</i><div><b>${esc(p.callsign)}</b><span>${rankName(p.rank)} · ${p.xp} XP</span></div></div>
+          <div class="xpbar" title="${p.nextXp ? `${p.xp} / ${p.nextXp}` : 'MAX'}"><i style="width:${pct}%"></i></div>
+          <button class="btn sm" data-a="profile">${L('战绩档案', 'Service record')}</button>`
+      }
+    }
+    if (a?.error && st !== 'authenticated') html += `<div class="acct-err">${esc(a.error)}</div>`
+    box.innerHTML = html
+    box.querySelector('[data-a=login]')?.addEventListener('click', () => {
+      this.click()
+      void this.account?.login()
+    })
+    box.querySelector('[data-a=profile]')?.addEventListener('click', () => {
+      this.click()
+      this.renderProfile()
+      s.querySelector('.profile-m')!.classList.add('on')
+    })
+    if (s.querySelector('.profile-m.on')) this.renderProfile()
+  }
+
+  private renderProfile(): void {
+    const s = this.screens.get('title')
+    const box = s?.querySelector<HTMLElement>('.prof')
+    const a = this.account
+    if (!s || !box || !a) return
+    const p = a.profile
+    if (a.status !== 'authenticated' || !p) {
+      s.querySelector('.profile-m')!.classList.remove('on')
+      return
+    }
+    const kd = p.deaths ? (p.kills / p.deaths).toFixed(2) : String(p.kills)
+    const wr = p.matches ? `${Math.round((p.wins / p.matches) * 100)}%` : '—'
+    const pct = p.nextXp ? Math.round(((p.xp - p.rankXp) / (p.nextXp - p.rankXp)) * 100) : 100
+    const stats: [string, string | number][] = [
+      [L('场次', 'Matches'), p.matches], [L('胜 / 负 / 平', 'W / L / D'), `${p.wins} / ${p.losses} / ${p.draws}`], [L('胜率', 'Win rate'), wr],
+      [L('总击倒', 'Kills'), p.kills], [L('K/D', 'K/D'), kd], [L('占领', 'Captures'), p.captures],
+      [L('爆头', 'Headshots'), p.headshots], [L('单局最多击倒', 'Best kills'), p.bestKills], [L('作战时长', 'Time played'), fmtHours(p.playSeconds)],
+    ]
+    const res = (r: CloudRecord) => (r.result === 'win' ? `<b class="w">${L('胜', 'W')}</b>` : r.result === 'draw' ? `<b class="d">${L('平', 'D')}</b>` : `<b class="l">${L('负', 'L')}</b>`)
+    const when = (iso: string) => new Date(iso).toLocaleString(getLang() === 'zh' ? 'zh-CN' : 'en-GB', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+    const rows = a.recent.length
+      ? a.recent.map(r => `<div class="rrow">${res(r)}<span>${when(r.createdAt)}</span><span>${r.mode === 'sea' ? L('出海', 'Sea') : L('标准', 'Std')} · ${r.perTeam}v${r.perTeam} · ${difficultyName(r.difficulty)}</span><span>${r.teamScore}:${r.enemyScore}</span><span>${r.kills}/${r.deaths}/${r.captures}</span><span>${formatClock(r.durationSec)}</span><span class="xp">+${r.xpGained}</span></div>`).join('')
+      : `<div class="empty">${L('还没有云端对局记录——打完一局就会出现在这里。', 'No cloud matches yet — finish a match and it appears here.')}</div>`
+    const pend = a.pendingCount
+    box.innerHTML = `<div class="panel-h">${L('战绩档案', 'Service record')} <button class="x" data-a="pclose">×</button></div>
+      <div class="prof-top">
+        <div class="acct-id big"><i class="rk">${p.rank + 1}</i><div><b>${esc(p.callsign)}</b><span>${rankName(p.rank)}${a.userName ? ` · ${L('账号', 'Account')}：${esc(a.userName)}` : ''}</span></div></div>
+        <div class="prog"><div class="xpbar"><i style="width:${pct}%"></i></div><span>${p.nextXp ? L(`${p.xp} / ${p.nextXp} XP · 距 ${rankName(p.rank + 1)} 还差 ${p.nextXp - p.xp}`, `${p.xp} / ${p.nextXp} XP · ${p.nextXp - p.xp} to ${rankName(p.rank + 1)}`) : L(`${p.xp} XP · 已达最高军衔`, `${p.xp} XP · top rank`)}</span></div>
+        <form class="cs"><label>${L('呼号', 'Callsign')}</label><input maxlength="24" minlength="2" value="${esc(p.callsign)}" required><button class="btn sm">${L('保存', 'Save')}</button></form>
+      </div>
+      <div class="pstats">${stats.map(([k, v]) => `<div><b>${v}</b><span>${k}</span></div>`).join('')}</div>
+      <h3>${L('最近对局', 'Recent matches')}</h3>
+      <div class="rlist"><div class="rrow h"><span></span><span>${L('时间', 'Time')}</span><span>${L('模式', 'Mode')}</span><span>${L('比分', 'Score')}</span><span>${L('击倒/阵亡/占领', 'K/D/Cap')}</span><span>${L('时长', 'Length')}</span><span>XP</span></div>${rows}</div>
+      <div class="pfoot"><span>${pend ? L(`${pend} 场对局等待上传，将自动重试`, `${pend} match(es) waiting to upload — retrying automatically`) : L('档案与设置已保存到你的账号，可在任何设备登录继续。', 'Profile and settings are saved to your account — sign in on any device to continue.')}</span>
+        <button class="btn sm" data-a="logout">${L('退出登录', 'Sign out')}</button></div>`
+    box.querySelector('[data-a=pclose]')!.addEventListener('click', () => {
+      this.click()
+      s.querySelector('.profile-m')!.classList.remove('on')
+    })
+    box.querySelector('[data-a=logout]')!.addEventListener('click', () => {
+      this.click()
+      s.querySelector('.profile-m')!.classList.remove('on')
+      void a.logout()
+    })
+    const form = box.querySelector<HTMLFormElement>('form.cs')!
+    form.addEventListener('submit', e => {
+      e.preventDefault()
+      this.click()
+      const v = form.querySelector('input')!.value.trim()
+      if (v.length >= 2 && v !== p.callsign) void a.setCallsign(v)
+    })
+  }
+
+  private renderEndSync(): void {
+    const box = this.screens.get('end')?.querySelector<HTMLElement>('.end-sync')
+    if (!box) return
+    const a = this.account
+    const u = a?.lastUpload ?? { kind: 'local' }
+    let html = ''
+    if (u.kind === 'uploading') html = L('正在上传战绩到云端…', 'Uploading match to the cloud…')
+    else if (u.kind === 'saved')
+      html = `${L('战绩已保存到云端', 'Match saved to the cloud')} · <b>+${u.xpGained} XP</b>${u.rankUp ? ` · <b class="g">${L(`晋升为 ${rankName(u.rank)}！`, `Promoted to ${rankName(u.rank)}!`)}</b>` : ''}`
+    else if (u.kind === 'queued') html = L('网络不稳定：战绩已暂存，稍后自动上传', 'Connection issue — match stored and will upload automatically')
+    else if (a?.status === 'logged_out') html = L('登录后可云端保存战绩与军衔进度（标题页左下角）', 'Sign in (title screen, bottom left) to save records and rank progress to the cloud')
+    box.innerHTML = html
+  }
   private updateCareer(): void {
     const d = this.save.data
     const c = this.screens.get('title')?.querySelector('.career')
+    const cp = this.account?.status === 'authenticated' ? this.account.profile : null
+    if (c && cp) {
+      c.innerHTML = L(`云端战绩：${cp.matches} 场 · 胜 ${cp.wins} · 单局最多击倒 ${cp.bestKills}`, `Cloud record: ${cp.matches} matches · ${cp.wins} wins · best ${cp.bestKills} kills`)
+      return
+    }
     if (c) c.innerHTML = d.matches ? L(`战绩：${d.matches} 场 · 胜 ${d.wins} · 单局最多击倒 ${d.bestKills}`, `Record: ${d.matches} matches · ${d.wins} wins · best ${d.bestKills} kills`) : ''
   }
 
@@ -343,10 +479,11 @@ export class Ui {
 
   private buildEnd(): void {
     const s = this.screen_('end', 'end')
-    s.innerHTML = `<div class="panel end-panel"><div class="end-banner"></div><div class="end-reason"></div><div class="end-score"></div><div class="end-stats"></div><div class="end-board"></div>
+    s.innerHTML = `<div class="panel end-panel"><div class="end-banner"></div><div class="end-reason"></div><div class="end-score"></div><div class="end-stats"></div><div class="end-sync"></div><div class="end-board"></div>
       <div class="btns"><button class="btn primary" data-a="restart">${L('再战一局', 'Play again')}</button><button class="btn" data-a="quit">${L('返回标题', 'Back to title')}</button></div></div>`
     s.querySelector('[data-a=restart]')!.addEventListener('click', () => this.actions.restart())
     s.querySelector('[data-a=quit]')!.addEventListener('click', () => this.actions.quit())
+    this.renderEndSync()
   }
 
   private showEnd(r: MatchResult): void {
@@ -355,8 +492,25 @@ export class Ui {
     const d = this.save.data
     this.save.update({ matches: d.matches + 1, wins: d.wins + (r.winner === PLAYER_TEAM ? 1 : 0), bestKills: Math.max(d.bestKills, r.player.kills) })
     this.updateCareer()
+    const p = r.player
+    const n = (v: number, max: number) => Math.max(0, Math.min(max, Math.round(v)))
+    void this.account?.recordMatch({
+      mode: r.sea ? 'sea' : 'standard',
+      difficulty: RT.difficulty,
+      perTeam: RT.perTeam,
+      result: r.winner < 0 ? 'draw' : r.winner === PLAYER_TEAM ? 'win' : 'loss',
+      reason: r.reason || 'time',
+      teamScore: n(r.scores[PLAYER_TEAM], 1200),
+      enemyScore: n(r.scores[1 - PLAYER_TEAM], 1200),
+      kills: n(p.kills, 300),
+      deaths: n(p.deaths, 300),
+      captures: n(p.captures, 200),
+      headshots: n(p.headshots, 3000),
+      damage: n(p.damage, 300000),
+      accuracy: Math.max(0, Math.min(1, p.accuracy)),
+      durationSec: n(r.time, 660),
+    })
   }
-
   private fillEnd(r: MatchResult): void {
     const s = this.screens.get('end')!
     const win = r.winner === PLAYER_TEAM
