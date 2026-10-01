@@ -6,7 +6,7 @@ import { L } from './i18n'
 import { isWater, LAND, SEA, type SkillId } from './map'
 import type { Unit } from './units'
 
-export type PlayerMode = 'foot' | 'vehicle' | 'drone' | 'heli' | 'aa' | 'arty' | 'dead'
+export type PlayerMode = 'foot' | 'vehicle' | 'drone' | 'heli' | 'gunship' | 'aa' | 'arty' | 'dead'
 export type WeaponSlot = 'rifle' | 'pistol' | 'launcher'
 export const WEAPON_ORDER: WeaponSlot[] = ['rifle', 'pistol', 'launcher']
 

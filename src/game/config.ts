@@ -112,6 +112,14 @@ export const CONFIG = {
   },
   car: { hp: 480, maxSpeed: 24, reverse: 9, accel: 15, brake: 30, turn: 1.9, radius: 1.9, gunDamage: 16, gunInterval: 0.09, ramDamage: 140, respawn: 25 },
   boat: { hp: 300, maxSpeed: 30, reverse: 8, accel: 16, brake: 18, turn: 1.5, radius: 2.2, gunDamage: 14, gunInterval: 0.1, respawn: 25 },
+  /** 飞鱼高速登陆艇 (sea mode): faster than the assault boat, armoured, driver + 5 infantry. */
+  lander: { hp: 560, maxSpeed: 38, reverse: 8, accel: 19, brake: 20, turn: 1.25, radius: 2.7, gunDamage: 15, gunInterval: 0.09, respawn: 30, seats: 5, boardRadius: 11, boardWait: 7 },
+  /** 雷鸣武装直升机 (sea mode): pilotable or AI-flown attack helicopter. */
+  gunship: {
+    hp: 900, speed: 34, climb: 11, height: 32, cannonDamage: 24, cannonInterval: 0.11, cannonRange: 320,
+    rockets: 16, rocketDamage: 150, rocketRadius: 6, rocketSpeed: 95, rocketInterval: 0.28,
+    respawn: 70, sortieEvery: 55, sortieTime: 40, rearmTime: 6, aiRange: 110,
+  },
   drone: { duration: 15, cooldown: 35, height: 46, speed: 26, markRadius: 42, markTime: 20, hp: 80 },
   scout: { hp: 70, first: 40, interval: 80, duration: 30, height: 36, radius: 28, markRadius: 34 },
   heli: { hp: 700, cruise: 28, height: 30, supportTime: 16, cooldown: 75, gunDamage: 9, gunInterval: 0.14, range: 60, respawn: 60, enemyFirstCall: 100 },
@@ -144,7 +152,7 @@ export const CONFIG = {
     rocketDamage: 105,
     blast: 7,
     flight: 3.2,
-    range: 280,
+    range: 340,
     cursorSpeed: 55,
   },
 } as const

@@ -5,8 +5,9 @@ import { CONFIG, TEAM_COLORS } from './config'
 import { HELIPADS } from './map'
 import type { Shooter, Unit } from './units'
 
-export type HeliPhase = 'parked' | 'takeoff' | 'transit' | 'hover' | 'orbit' | 'return' | 'landing' | 'down' | 'wreck'
-export type HeliMission = { insert: boolean; x: number; z: number; name: string }
+export type HeliPhase = 'parked' | 'takeoff' | 'transit' | 'hover' | 'orbit' | 'return' | 'landing' | 'down' | 'wreck' | 'piloted' | 'landed'
+/** `land`: touch down at (x, y, z) to drop the passenger (e.g. the 出海岛 helipad) instead of a hover insertion. */
+export type HeliMission = { insert: boolean; x: number; z: number; name: string; land?: boolean; y?: number }
 
 export interface HeliHost {
   time: number
@@ -26,33 +27,40 @@ export class Heli {
   readonly prev = new THREE.Vector3()
   readonly vel = new THREE.Vector3()
   readonly mesh = new THREE.Group()
-  private readonly body = new THREE.Group()
-  private readonly rotor = new THREE.Group()
-  private readonly tailRotor = new THREE.Group()
-  private readonly searchLight: THREE.Mesh
+  protected readonly body = new THREE.Group()
+  protected readonly rotor = new THREE.Group()
+  protected readonly tailRotor = new THREE.Group()
+  protected searchLight!: THREE.Mesh
+  /** Gunships are only present in sea mode; transport helicopters are always enabled. */
+  enabled = true
   yaw = 0
   prevYaw = 0
   bank = 0
   pitch = 0
   hp: number = CONFIG.heli.hp
-  readonly maxHp: number = CONFIG.heli.hp
+  maxHp: number = CONFIG.heli.hp
   phase: HeliPhase = 'parked'
   mission: HeliMission | null = null
   passenger: Unit | null = null
   readyAt = 0
-  private phaseUntil = 0
-  private orbitA = 0
-  private gunCd = 0
-  private rotorSpeed = 0
-  private spin = 0
+  protected phaseUntil = 0
+  protected orbitA = 0
+  protected gunCd = 0
+  protected rotorSpeed = 0
+  protected spin = 0
   get name(): string {
     return this.team === 0 ? L('红方直升机 “赤隼”', 'Red helicopter “Falcon”') : L('蓝方直升机 “海鹞”', 'Blue helicopter “Harrier”')
   }
-  readonly pad: { x: number; z: number }
-
+  pad: { x: number; z: number }
   constructor(readonly team: number, scene: THREE.Scene) {
     this.pad = HELIPADS[team]
-    const color = TEAM_COLORS[team]
+    this.buildModel(TEAM_COLORS[team])
+    this.mesh.add(this.body)
+    this.mesh.rotation.order = 'YXZ'
+    scene.add(this.mesh)
+    this.parkNow()
+  }
+  protected buildModel(color: number): void {
     const m = (c: number, o: Partial<THREE.MeshStandardMaterialParameters> = {}) => new THREE.MeshStandardMaterial({ color: c, roughness: 0.5, metalness: 0.35, ...o })
     const hull = m(0x46525c)
     const accent = m(color, { emissive: color, emissiveIntensity: 0.3 })
@@ -97,10 +105,6 @@ export class Heli {
     this.searchLight = add(this.body, new THREE.ConeGeometry(4, 16, 16, 1, true), new THREE.MeshBasicMaterial({ color: 0xfff2c0, transparent: true, opacity: 0.08, depthWrite: false, side: THREE.DoubleSide }), 0, -6.5, 3)
     this.searchLight.castShadow = false
     this.searchLight.visible = false
-    this.mesh.add(this.body)
-    this.mesh.rotation.order = 'YXZ'
-    scene.add(this.mesh)
-    this.parkNow()
   }
 
   get airborne(): boolean {
@@ -191,23 +195,30 @@ export class Heli {
         if (Math.hypot(this.pos.x - m!.x, this.pos.z - m!.z) < 6) {
           if (m!.insert && this.passenger) {
             this.phase = 'hover'
-            this.phaseUntil = host.time + 2.2
+            this.phaseUntil = host.time + (m!.land ? 5 : 2.2)
           } else {
             this.phase = 'orbit'
             this.phaseUntil = host.time + cfg.supportTime
           }
         }
         break
-      case 'hover':
-        target = tmp.set(m!.x, 14, m!.z)
-        speed = 10
-        if (host.time >= this.phaseUntil && this.pos.y < 17) {
+      case 'hover': {
+        // Hover insertion, or a real touchdown on a pad (出海岛 helipad).
+        const gy = m!.land ? (m!.y ?? 0) : 14
+        target = tmp.set(m!.x, gy, m!.z)
+        speed = m!.land ? 7 : 10
+        if (m!.land && this.pos.y < gy + 0.25) {
+          this.pos.y = gy
+          this.vel.set(0, 0, 0)
+        }
+        if (host.time >= this.phaseUntil && this.pos.y < (m!.land ? gy + 0.4 : 17)) {
           host.onHeliDrop(this)
           this.passenger = null
           this.phase = 'orbit'
           this.phaseUntil = host.time + cfg.supportTime
         }
         break
+      }
       case 'orbit': {
         this.orbitA += dt * 0.42
         target = tmp.set(m!.x + Math.cos(this.orbitA) * 24, 26, m!.z + Math.sin(this.orbitA) * 24)
@@ -231,6 +242,16 @@ export class Heli {
           this.passenger = null
         }
         break
+      case 'down':
+      case 'wreck':
+        this.crashStep(dt, host, cfg.respawn)
+        return
+    }
+    if (target) this.fly(target, speed, dt)
+  }
+  /** Falling / burning wreck. Returns after parking again once the respawn time passed. */
+  protected crashStep(dt: number, host: HeliHost, respawn: number): void {
+    switch (this.phase) {
       case 'down': {
         this.spin += dt * 4
         this.yaw += this.spin * dt
@@ -242,7 +263,7 @@ export class Heli {
         if (this.pos.y <= Math.max(g, -1.2)) {
           this.pos.y = Math.max(g, -1.2)
           this.phase = 'wreck'
-          this.phaseUntil = host.time + cfg.respawn
+          this.phaseUntil = host.time + respawn
           host.onHeliCrash(this)
         }
         return
@@ -252,7 +273,10 @@ export class Heli {
         if (host.time >= this.phaseUntil) this.parkNow()
         return
     }
-    if (target) {
+  }
+  /** Steer towards a point at a cruise speed, banking and pitching with the motion. */
+  protected fly(target: THREE.Vector3, speed: number, dt: number): void {
+    {
       const dx = target.x - this.pos.x, dy = target.y - this.pos.y, dz = target.z - this.pos.z
       const d = Math.hypot(dx, dy, dz)
       const want = Math.min(speed, d * 1.2)

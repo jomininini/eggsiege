@@ -2,7 +2,7 @@ import * as THREE from 'three'
 import type { Collision } from './collide'
 import { CONFIG, RT } from './config'
 import { L } from './i18n'
-import { BASES, BEACHES, CANAL_ROUTE, EGG, inIsland, ISLAND, ISLAND_POINT, LAKE, POINTS, type PointDef } from './map'
+import { BASES, BEACHES, CANAL_ROUTE, EGG, inIsland, ISLAND, ISLAND_POINT, LAKE, PIERS, POINTS, SHORE_Z, type PointDef } from './map'
 import type { NavGrid, P2 } from './nav'
 import type { MatchState } from './rules'
 import { SoldierMesh } from './soldier'
@@ -30,6 +30,10 @@ export interface BotHost {
   fireMissile(bot: Bot, from: THREE.Vector3, dir: THREE.Vector3, seeker: SeekerSpec | null): void
   board(bot: Bot, v: Vehicle): void
   disembark(bot: Bot, x: number, z: number): void
+  /** Take a passenger seat on a landing craft; false if full / gone. */
+  boardPassenger(bot: Bot, v: Vehicle): boolean
+  /** Put every passenger of a landing craft ashore around (x, z). */
+  unload(v: Vehicle, x: number, z: number): void
   islandOwner(): number
   /** Centre of an incoming artillery strike covering (x, z), if any. */
   danger(x: number, z: number): { x: number; z: number; r: number } | null
@@ -89,6 +93,10 @@ export class Bot implements Unit {
   speedNow = 0
   respawnAt = 0
   ride: Ride | null = null
+  /** Riding on a landing craft's deck. */
+  passengerOf: Vehicle | null = null
+  private boardAsPassenger = false
+  private boardUntil = 0
   private path: P2[] = []
   private goal: P2 | null = null
   goalPoint = -1
@@ -141,6 +149,8 @@ export class Bot implements Unit {
     this.path = []
     this.goal = null
     this.ride = null
+    this.passengerOf = null
+    this.boardAsPassenger = false
     this.boardTarget = null
     this.sheltered = false
     this.nextThink = 0
@@ -166,6 +176,7 @@ export class Bot implements Unit {
     this.respawnAt = host.time + CONFIG.bots.respawn
     this.target = null
     this.ride = null
+    this.passengerOf = null
     this.boardTarget = null
     this.sheltered = false
   }
@@ -188,13 +199,24 @@ export class Bot implements Unit {
       this.shoot(host)
       return
     }
+    if (this.passengerOf) {
+      const v = this.passengerOf
+      const i = v.passengers.indexOf(this)
+      if (!v.alive || i < 0) this.passengerOf = null
+      else {
+        v.seatPos(i, this.pos)
+        this.speedNow = 0
+        this.shoot(host)
+        return
+      }
+    }
     if (t >= this.nextThink || (!this.path.length && !this.goal)) this.think(host)
     this.move(dt, host)
     this.shoot(host)
   }
 
   private eye(out: THREE.Vector3): THREE.Vector3 {
-    return out.set(this.pos.x, this.pos.y + (this.ride ? 2.2 : 1.55), this.pos.z)
+    return out.set(this.pos.x, this.pos.y + (this.ride ? 2.2 : this.passengerOf ? 1.35 : 1.55), this.pos.z)
   }
 
   private sense(host: BotHost): void {
@@ -273,6 +295,17 @@ export class Bot implements Unit {
   }
 
   private think(host: BotHost): void {
+    // A standing passenger order survives re-thinks while its landing craft still waits at the pier.
+    const ord = this.boardAsPassenger ? this.boardTarget : null
+    if (ord && ord.alive && ord.driver && ord.driver.team === this.team && ord.freeSeats > 0 && Math.abs(ord.speed) < 3
+      && Math.hypot(ord.pos.x - ord.spawn.x, ord.pos.z - ord.spawn.z) < 15 && this.boardUntil > host.time) {
+      const s = this.dockSpot(ord)
+      this.setGoal(host, s.x, s.z)
+      if (!this.path.length && !this.goal) this.setGoal(host, ord.pos.x, ord.pos.z)
+      this.nextThink = host.time + 3
+      return
+    }
+    this.boardAsPassenger = false
     this.boardTarget = null
     if (RT.sea && this.role === 'marine' && this.marineThink(host)) return
     const st = host.match.points
@@ -322,14 +355,64 @@ export class Bot implements Unit {
       return true
     }
     if (own !== this.team) {
+      const lift = this.boardingLander(host)
+      if (lift) {
+        this.goBoard(host, lift)
+        this.boardAsPassenger = true
+        this.boardUntil = host.time + 25
+        return true
+      }
       const boat = this.freeBoat(host, false)
       if (boat) return this.goBoard(host, boat)
     }
     return false
   }
+  /** Landing craft this bot is walking to as a passenger (player-driven or AI). */
+  get boardingFor(): Vehicle | null {
+    return this.boardAsPassenger ? this.boardTarget : null
+  }
+  /** Ordered aboard a landing craft held at its pier (by the player). */
+  orderBoard(host: BotHost, v: Vehicle): boolean {
+    const s = this.dockSpot(v)
+    if (!this.reachable(host, s.x, s.z)) return false
+    this.goBoard(host, v)
+    this.boardAsPassenger = true
+    this.boardUntil = host.time + 25
+    this.nextThink = host.time + 25
+    return true
+  }
+  cancelBoard(): void {
+    this.boardTarget = null
+    this.boardAsPassenger = false
+    this.nextThink = 0
+  }
+  /** Just put ashore from a landing craft: storm the isle if that is where we are. */
+  afterUnload(host: BotHost): void {
+    this.passengerOf = null
+    this.path = []
+    this.goal = null
+    if (inIsland(this.pos.x, this.pos.z, 1)) {
+      this.goalPoint = ISLAND_POINT
+      const spot = pointSpot(POINTS[ISLAND_POINT])
+      this.setGoal(host, spot.x, spot.z)
+      this.nextThink = host.time + 12
+    } else this.nextThink = 0
+  }
+  /** A friendly landing craft waiting at its pier with free seats. */
+  private boardingLander(host: BotHost): Vehicle | null {
+    for (const v of host.boats) {
+      if (v.kind !== 'lander' || !v.alive || !v.enabled || !v.driver || v.driver.team !== this.team || v.freeSeats <= 0) continue
+      if (Math.abs(v.speed) > 2 || Math.hypot(v.pos.x - v.spawn.x, v.pos.z - v.spawn.z) > 12) continue
+      const s = this.dockSpot(v)
+      if (Math.hypot(s.x - this.pos.x, s.z - this.pos.z) > 70 || !this.reachable(host, s.x, s.z)) continue
+      return v
+    }
+    return null
+  }
 
   private dockSpot(v: Vehicle): P2 {
-    if (v.island) return { x: Math.sign(v.spawn.x) * 10, z: -106.5 }
+    if (v.island) return { x: Math.sign(v.spawn.x) * 10, z: ISLAND.z + 21.5 }
+    if (v.kind === 'lander') return { x: Math.sign(v.spawn.x) * 100, z: SHORE_Z - PIERS[0].len + 1.5 }
     return { x: Math.sign(v.spawn.x) * 100, z: v.spawn.z }
   }
 
@@ -353,6 +436,7 @@ export class Bot implements Unit {
 
   private goBoard(host: BotHost, v: Vehicle): boolean {
     this.boardTarget = v
+    this.boardAsPassenger = false
     this.goalPoint = -1
     const s = this.dockSpot(v)
     this.setGoal(host, s.x, s.z)
@@ -366,14 +450,16 @@ export class Bot implements Unit {
     let land: P2
     let purpose: Ride['purpose']
     if (v.island) {
-      route.push({ x: v.pos.x * 0.35, z: -98 }, ...CANAL_ROUTE.map(p => ({ ...p })))
+      route.push({ x: v.pos.x * 0.35, z: ISLAND.z + 30 }, ...CANAL_ROUTE.map(p => ({ ...p })))
       const side = Math.random() < 0.5 ? -1 : 1
       land = { x: side * 7.2, z: -12.5 }
       purpose = 'lake'
     } else {
-      if (Math.abs(v.pos.x) > 98) route.push({ x: v.pos.x, z: -102 })
+      if (Math.abs(v.pos.x) > 98) route.push({ x: v.pos.x, z: -108 })
       const b = BEACHES[this.team]
-      route.push({ x: (v.pos.x + b.wx) / 2, z: -112 }, { x: b.wx, z: b.wz })
+      route.push({ x: (v.pos.x + b.wx) / 2, z: ISLAND.z + 30 }, { x: b.wx, z: b.wz })
+      // Landing craft wait at the pier for a squad before casting off.
+      if (v.kind === 'lander') v.boardingUntil = host.time + CONFIG.lander.boardWait
       land = { x: b.lx, z: b.lz }
       purpose = 'island'
     }
@@ -392,6 +478,7 @@ export class Bot implements Unit {
       return
     }
     const arrive = () => {
+      if (v.passengers.length) host.unload(v, r.land.x, r.land.z)
       host.disembark(this, r.land.x, r.land.z)
       this.ride = null
       this.nextThink = 0
@@ -401,6 +488,15 @@ export class Bot implements Unit {
         this.setGoal(host, spot.x, spot.z)
         this.nextThink = host.time + 12
       }
+    }
+    if (v.kind === 'lander' && host.time < v.boardingUntil && v.freeSeats > 0) {
+      // Holding at the pier while the squad climbs aboard.
+      v.drive(dt, 0, 0, host.col)
+      this.pos.copy(v.pos)
+      this.yaw = v.yaw
+      r.since = host.time
+      r.slowSince = host.time
+      return
     }
     if (host.time - r.since > 110) {
       arrive()
@@ -453,10 +549,22 @@ export class Bot implements Unit {
     let speed = cfg.speed
     if (this.boardTarget) {
       const v = this.boardTarget
-      if (!v.alive || v.driver || !v.enabled) {
+      if (!this.boardAsPassenger && (!v.alive || v.driver || !v.enabled)) {
         this.boardTarget = null
         this.nextThink = 0
-      } else if (Math.hypot(v.pos.x - this.pos.x, v.pos.z - this.pos.z) < 8.5) {
+      } else if (this.boardAsPassenger) {
+        if (!v.alive || !v.driver || v.driver.team !== this.team || v.freeSeats <= 0 || Math.abs(v.speed) > 3) {
+          this.boardTarget = null
+          this.boardAsPassenger = false
+          this.nextThink = 0
+        } else if (Math.hypot(v.pos.x - this.pos.x, v.pos.z - this.pos.z) < CONFIG.lander.boardRadius && host.boardPassenger(this, v)) {
+          this.boardTarget = null
+          this.boardAsPassenger = false
+          this.path = []
+          this.goal = null
+          return
+        }
+      } else if (Math.hypot(v.pos.x - this.pos.x, v.pos.z - this.pos.z) < (v.kind === 'lander' ? CONFIG.lander.boardRadius : 8.5)) {
         this.startRide(host, v)
         return
       }

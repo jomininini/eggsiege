@@ -5,7 +5,8 @@ import { L } from './i18n'
 import { isWater, LAND, SEA, SHORE_Z, WATER_Y } from './map'
 import type { Unit } from './units'
 
-export type VehicleKind = 'car' | 'boat'
+export type VehicleKind = 'car' | 'boat' | 'lander'
+const cfgOf = (k: VehicleKind) => (k === 'car' ? CONFIG.car : k === 'boat' ? CONFIG.boat : CONFIG.lander)
 type Spawn = { team: number; x: number; z: number; yaw: number }
 
 const tmp = new THREE.Vector3()
@@ -36,15 +37,22 @@ export class Vehicle {
   enabled = true
   /** 出海岛 patrol boat: owned by whoever holds the island. */
   readonly island: boolean
+  /** Infantry riding on deck (landing craft only). */
+  passengers: Unit[] = []
+  readonly seats: number
+  /** Landing craft waits at the pier for troops until this time (AI driver). */
+  boardingUntil = 0
   constructor(readonly kind: VehicleKind, public team: number, readonly spawn: Spawn, scene: THREE.Scene, island = false) {
     this.island = island
-    const cfg = kind === 'car' ? CONFIG.car : CONFIG.boat
+    const cfg = cfgOf(kind)
     this.maxHp = this.hp = cfg.hp
     this.radius = cfg.radius
-    this.half = kind === 'car' ? { x: 1.25, y: 1.0, z: 2.4 } : { x: 1.5, y: 0.9, z: 3.3 }
+    this.seats = kind === 'lander' ? CONFIG.lander.seats : 0
+    this.half = kind === 'car' ? { x: 1.25, y: 1.0, z: 2.4 } : kind === 'boat' ? { x: 1.5, y: 0.9, z: 3.3 } : { x: 1.9, y: 1.0, z: 4.6 }
     this.wreck = new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 1 })
     if (kind === 'car') this.buildCar()
-    else this.buildBoat()
+    else if (kind === 'boat') this.buildBoat()
+    else this.buildLander()
     this.mesh.traverse(o => {
       if ((o as THREE.Mesh).isMesh) {
         o.castShadow = true
@@ -55,8 +63,25 @@ export class Vehicle {
     this.reset()
   }
 
+  /** Boats and landing craft float; cars drive. */
+  get naval(): boolean {
+    return this.kind !== 'car'
+  }
+  get cfg() {
+    return cfgOf(this.kind)
+  }
+  get freeSeats(): number {
+    return this.seats - this.passengers.length
+  }
+  /** Deck position of passenger seat i (world). */
+  seatPos(i: number, out: THREE.Vector3): THREE.Vector3 {
+    const lx = (i % 2 === 0 ? -0.9 : 0.9), lz = 1.9 - Math.floor(i / 2) * 1.5
+    const c = Math.cos(this.yaw), s = Math.sin(this.yaw)
+    return out.set(this.pos.x + lx * c + lz * s, this.pos.y + 1.15, this.pos.z - lx * s + lz * c)
+  }
   get label(): string {
     if (this.kind === 'car') return L('轻型战车', 'light combat vehicle')
+    if (this.kind === 'lander') return L('飞鱼高速登陆艇', 'Flying Fish landing craft')
     return this.island ? L('出海岛巡逻艇', 'island patrol boat') : L('登陆快艇', 'assault boat')
   }
 
@@ -142,7 +167,32 @@ export class Vehicle {
     this.mesh.add(this.turret)
   }
 
+  /** Bow ramp, deck rails, armoured wheelhouse at the stern and a bow gun. */
+  private buildLander(): void {
+    const team = TEAM_COLORS[this.team]
+    const hullMat = this.mat(0x56616b, { roughness: 0.5 })
+    const deck = this.mat(0x3a4249, { roughness: 0.8 })
+    const stripe = this.mat(team, { emissive: team, emissiveIntensity: 0.35 })
+    this.stripe = stripe
+    const box = new THREE.BoxGeometry(1, 1, 1)
+    this.add(this.mesh, box, hullMat, 0, 0.55, 0, 3.8, 1.1, 9.2)
+    this.add(this.mesh, box, deck, 0, 1.12, 0, 3.4, 0.06, 8.6)
+    this.add(this.mesh, box, stripe, 0, 0.9, 0, 3.86, 0.16, 9.26)
+    const ramp = this.add(this.mesh, box, hullMat, 0, 1.25, 4.55, 3.5, 1.2, 0.14)
+    ramp.rotation.x = -0.25
+    for (const x of [-1.85, 1.85]) this.add(this.mesh, box, this.mat(0x2a3138), x, 1.55, 0.4, 0.12, 0.8, 7.4)
+    this.add(this.mesh, box, this.mat(0x2d3640), 0, 1.75, -3.5, 2.6, 1.3, 1.8)
+    this.add(this.mesh, box, this.mat(0x9fd6ea, { roughness: 0.05, transparent: true, opacity: 0.6 }), 0, 2.05, -2.58, 2.4, 0.5, 0.06)
+    this.add(this.mesh, box, new THREE.MeshBasicMaterial({ color: team, toneMapped: false }), 0, 2.48, -3.5, 1.2, 0.1, 0.3)
+    this.add(this.mesh, box, this.mat(0x1a1f24), 0, 0.9, -4.8, 2.2, 0.8, 0.5)
+    this.turret.position.set(0, 1.7, 3.6)
+    this.add(this.turret, box, this.mat(0x2a3138), 0, 0.15, 0, 0.6, 0.35, 0.6)
+    this.add(this.turret, new THREE.CylinderGeometry(0.07, 0.07, 1.6, 8).rotateX(Math.PI / 2), this.mat(0x1d2227), 0, 0.22, 0.85)
+    this.mesh.add(this.turret)
+  }
   reset(): void {
+    this.passengers = []
+    this.boardingUntil = 0
     this.pos.set(this.spawn.x, this.kind === 'car' ? 0 : WATER_Y, this.spawn.z)
     this.prev.copy(this.pos)
     this.yaw = this.prevYaw = this.spawn.yaw
@@ -180,7 +230,7 @@ export class Vehicle {
     this.prev.copy(this.pos)
     this.prevYaw = this.yaw
     if (!this.alive) return 0
-    const cfg = this.kind === 'car' ? CONFIG.car : CONFIG.boat
+    const cfg = this.cfg
     if (throttle > 0) this.speed += (this.speed < 0 ? cfg.brake : cfg.accel) * throttle * dt
     else if (throttle < 0) this.speed -= (this.speed > 0 ? cfg.brake : cfg.accel * 0.6) * -throttle * dt
     else this.speed *= 1 - dt * (this.kind === 'car' ? 0.9 : 0.55)
@@ -265,7 +315,7 @@ export class Vehicle {
     let dy = this.yaw - this.prevYaw
     dy = Math.atan2(Math.sin(dy), Math.cos(dy))
     this.mesh.rotation.y = this.prevYaw + dy * alpha
-    if (this.kind === 'boat') {
+    if (this.naval) {
       this.mesh.rotation.x = -Math.min(0.12, Math.abs(this.speed) * 0.004)
       this.mesh.rotation.z = Math.sin(this.bob * 0.7) * 0.03
     }

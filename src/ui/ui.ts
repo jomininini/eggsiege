@@ -34,10 +34,11 @@ const controls = (): [string, string][] => [
   [L('空格', 'Space'), L('跳跃', 'Jump')],
   ['C / Ctrl', L('蹲伏（更稳）', 'Crouch (steadier)')],
   ['G', L('投掷手雷', 'Throw grenade')],
-  ['E', L('交互：载具、无人机、直升机、岛上武器', 'Interact: vehicles, drone, helicopter, island weapons')],
+  ['E', L('交互：载具、登陆艇、武装直升机、无人机、直升机、岛上武器', 'Interact: vehicles, landing craft, gunship, drone, helicopter, island weapons')],
+  [L('空格 / C', 'Space / C'), L('武装直升机：爬升 / 下降；左键机炮、右键火箭弹', 'Gunship: climb / descend; LMB cannon, RMB rockets')],
   ['F', L('防空炮：切换瞄准 / 锁定模式', 'AA gun: toggle aim / lock mode')],
   ['B', L('无人机中：呼叫火箭炮轰炸下方', 'In drone: call a rocket strike below')],
-  ['1 - 5', L('直升机目标据点 / 阵亡后 2 选择出海岛重生', 'Heli target / after death press 2 to respawn on the isle')],
+  ['1 - 6', L('直升机目标（出海模式 6 = 降落出海岛）/ 阵亡后 2 选择出海岛重生', 'Heli target (sea mode 6 = land on the isle) / after death press 2 to respawn on the isle')],
   ['Tab', L('战况计分板', 'Scoreboard')],
   ['Esc / P', L('暂停', 'Pause')],
 ]
@@ -50,6 +51,7 @@ const legend = (): [string, string, string][] => [
   ['#9d8cff', L('科技公司 · 技能点', 'Tech firms · skills'), L('量子扫描、纳米护盾、智能稳定、神经加速，持续 22 秒。', 'Quantum scan, nano shield, smart stabiliser or neural rush for 22s.')],
   ['#5cff9d', L('会所 · 回血点', 'Clubhouse · healing'), L('站在会所泳池平台上持续恢复生命。', 'Stand on the clubhouse pool deck to regenerate.')],
   ['#7ef9ff', L('屋顶无人机坪', 'Rooftop drone pads'), L('10W、20E 屋顶，俯视侦察并标记敌人，可呼叫直升机与火箭炮。', '10W and 20E rooftops: scout from above, mark enemies, call the heli and rocket strikes.')],
+  ['#ffd35c', L('登陆艇 / 武装直升机（出海模式）', 'Landing craft / gunship (sea mode)'), L('码头尽头的飞鱼高速登陆艇可载 5 名步兵抢滩；部署区旁的武装直升机可驾驶，能降落在出海岛停机坪补给。', 'The Flying Fish landing craft at each pier head carries 5 infantry to the beach; the gunship beside the staging area can be flown and lands on the Offshore Isle helipad to rearm.')],
   ['#ff4d5e', L('直升机 / 战车 / 快艇', 'Helicopter / cars / boats'), L('停机坪机降突击；道路战车、码头快艇从海上登陆，快艇可经水道驶入金蛋湖。', 'Heli insertion from the helipad; road cars and pier boats for landings — boats can sail the canal into the Egg Lake.')],
 ]
 
@@ -440,7 +442,11 @@ export class Ui {
       this.miniSea = RT.sea
       this.miniBg = undefined
     }
-    this.mini.height = RT.sea ? 214 : 184
+    // Keep the map to scale: the sea-mode view reaches out to the (now distant) isle.
+    const minX = LAND.minX - 6, maxX = LAND.maxX + 6
+    const minZ = RT.sea ? ISLAND.z - ISLAND.rz - 8 : SEA.minZ + 60
+    const h = Math.round(this.mini.width * (LAND.maxZ + 4 - minZ) / (maxX - minX))
+    this.mini.height = RT.sea ? Math.min(300, h) : 184
   }
 
   private set(key: string, e: HTMLElement, html: string): void {
@@ -553,7 +559,8 @@ export class Ui {
     // Vitals.
     const veh = g.activeVehicle
     const seat = g.seatStatus()
-    const armour = veh ? { hp: veh.hp, max: veh.maxHp } : seat ? { hp: seat.hp, max: seat.maxHp } : null
+    const gs = g.gunshipStatus()
+    const armour = veh ? { hp: veh.hp, max: veh.maxHp } : seat ? { hp: seat.hp, max: seat.maxHp } : gs ? { hp: gs.hp, max: gs.maxHp } : null
     if (armour) {
       this.set('hp', h.hp, String(Math.ceil(armour.hp)))
       h.hpfill.style.width = `${(armour.hp / armour.max) * 100}%`
@@ -571,8 +578,13 @@ export class Ui {
     const launcher = p.weapon === 'launcher'
     const pistol = p.weapon === 'pistol'
     h.slots.className = `slots ${launcher ? 'w3' : pistol ? 'w2' : 'w1'}`
-    h.slots.style.display = veh || seat ? 'none' : ''
-    if (veh) {
+    h.slots.style.display = veh || seat || gs ? 'none' : ''
+    if (gs) {
+      this.set('wname', h.wname, L(`${gs.name} · 机炮 + 火箭弹`, `${gs.name} · cannon + rockets`))
+      this.set('mag', h.mag, String(gs.rockets))
+      this.set('res', h.res, `/ ${gs.maxRockets} · ${gs.grounded ? L('着陆', 'landed') : `${gs.alt} m`}`)
+      h.ammo.className = 'ammo veh'
+    } else if (veh) {
       this.set('wname', h.wname, L(`${veh.label} · 车载机枪`, `${veh.label} · mounted gun`))
       this.set('mag', h.mag, `${Math.round(Math.abs(veh.speed) * 3.6)}`)
       this.set('res', h.res, 'km/h')
@@ -622,7 +634,7 @@ export class Ui {
     }
     this.set('gn', h.gn, String(p.grenades))
     this.set('rk', h.rk, String(p.rocket + p.rocketReserve))
-    h.reload.classList.toggle('on', !veh && !seat && p.reloading)
+    h.reload.classList.toggle('on', !veh && !seat && !gs && p.reloading)
     // Crosshair + lock ring.
     const onFoot = p.mode === 'foot' || p.mode === 'heli'
     const gap = 6 + p.spread(t) * 900
@@ -835,15 +847,24 @@ export class Ui {
     for (const v of game.vehicles) {
       if (!v.alive || !v.enabled) continue
       const [x, y] = this.mm(v.pos.x, v.pos.z)
-      g.fillStyle = v.driver ? '#ffffff' : v.kind === 'car' ? '#c9d4dd' : '#a9e4ff'
-      g.fillRect(x - 2.5, y - 2.5, 5, 5)
+      g.fillStyle = v.driver ? '#ffffff' : v.kind === 'car' ? '#c9d4dd' : v.kind === 'lander' ? '#ffd35c' : '#a9e4ff'
+      const sz = v.kind === 'lander' ? 7 : 5
+      g.fillRect(x - sz / 2, y - sz / 2, sz, sz)
     }
     for (const h of game.helis) {
-      if (!h.alive) continue
+      if (!h.alive || !h.enabled) continue
       const [x, y] = this.mm(h.pos.x, h.pos.z)
       g.strokeStyle = TEAM_CSS[h.team]
       g.lineWidth = 1.5
       g.beginPath()
+      if (game.gunships.includes(h as never)) {
+        // Gunship: diamond with a cross.
+        g.moveTo(x, y - 5)
+        g.lineTo(x + 5, y)
+        g.lineTo(x, y + 5)
+        g.lineTo(x - 5, y)
+        g.closePath()
+      }
       g.moveTo(x - 5, y)
       g.lineTo(x + 5, y)
       g.moveTo(x, y - 5)
@@ -891,7 +912,7 @@ export class Ui {
     }
     if (p.alive || p.mode === 'dead') {
       const [x, y] = this.mm(p.pos.x, p.pos.z)
-      const yaw = p.mode === 'vehicle' && game.activeVehicle ? game.activeVehicle.yaw + Math.PI : p.yaw
+      const yaw = p.mode === 'vehicle' && game.activeVehicle ? game.activeVehicle.yaw + Math.PI : game.gunshipYaw ?? p.yaw
       g.save()
       g.translate(x, y)
       g.rotate(-yaw)

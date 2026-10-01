@@ -5,7 +5,7 @@ import { Collision } from './collide'
 import { TEAM_CSS, TEAM_COLORS } from './config'
 import { L } from './i18n'
 import {
-  BASES, BOAT_SPAWNS, BRIDGES, BUILDINGS, CANAL, DRONE_PADS, EGG, HELIPADS, ISLAND, ISLAND_DEPOT, ISLAND_JETTIES, LAKE, LAND, PIERS, POINTS, ROADS,
+  BASES, BOAT_SPAWNS, BRIDGES, BUILDINGS, CANAL, DRONE_PADS, EGG, GUNSHIP_PADS, HELIPADS, ISLAND, ISLAND_DEPOT, ISLAND_HELIPAD, ISLAND_JETTIES, SEA, LAKE, LAND, PIERS, POINTS, ROADS,
   SHORE_Z, SKILLS, STATIONS, WATER_Y, isInlandWater, pointShort, type BuildingDef, type StationDef,
 } from './map'
 import { badgeTexture, eggTexture, facadeTextures, groundTexture, helipadTexture, signMesh, skyTexture, textTexture } from './textures'
@@ -16,6 +16,7 @@ const NEUTRAL = 0xe8edf2
 export type PointVisual = { ring: THREE.Mesh; disk: THREE.Mesh; beam: THREE.Mesh; badge: THREE.Sprite; badgeTex: THREE.Texture[] }
 export type StationVisual = { def: StationDef; ring: THREE.Mesh; icon: THREE.Sprite; baseY: number }
 type TextOpts = Parameters<typeof textTexture>[1]
+const tmpLabel = new THREE.Vector3()
 type LabelEntry = { obj: THREE.Sprite | THREE.Mesh; zh: string; en: string; h: number; opts: TextOpts }
 type BadgeEntry = { sprite: THREE.Sprite; zh: string; en: string; color: string }
 
@@ -525,6 +526,20 @@ export class World {
     const depotSign = this.label('弹药补给库 · 占岛后可用', 'Ammo depot · for the isle holder', 0.75, { color: '#ffe0b0', bg: 'rgba(60,30,5,0.85)', size: 40, pad: 10 })
     depotSign.position.set(D.x, I.y + 2.6, D.z)
     this.scene.add(depotSign)
+    // Helipad: transport helicopters land here; gunships land and rearm here for the isle holder.
+    const H = ISLAND_HELIPAD
+    const hpad = new THREE.Mesh(new THREE.CircleGeometry(H.r + 0.8, 40), new THREE.MeshStandardMaterial({ map: helipadTexture('#ffd35c', 'H'), roughness: 0.7 }))
+    hpad.rotation.x = -Math.PI / 2
+    hpad.position.set(H.x, H.y + 0.07, H.z)
+    hpad.receiveShadow = true
+    this.scene.add(hpad)
+    for (let i = 0; i < 8; i += 1) {
+      const a = (i / 8) * Math.PI * 2
+      this.box(H.x + Math.cos(a) * (H.r + 1.2), I.y, H.z + Math.sin(a) * (H.r + 1.2), 0.3, 0.25, 0.3, this.mats.ledWarm, false, false)
+    }
+    const hSign = this.label('出海岛停机坪 · 直升机可降落', 'Isle helipad · helicopters land here', 0.8, { color: '#fff4c2', bg: 'rgba(60,45,5,0.85)', size: 40, pad: 10 })
+    hSign.position.set(H.x, I.y + 4.2, H.z - H.r - 1)
+    this.scene.add(hSign)
     const jettySign = this.label('巡逻艇码头 · 可经水道直达金蛋湖', 'Patrol jetty · canal to the Egg Lake', 0.8, { color: '#fff', bg: 'rgba(120,90,10,0.85)', size: 40, pad: 10 })
     jettySign.position.set(I.x, I.y + 3, I.z + 15)
     this.scene.add(jettySign)
@@ -888,6 +903,16 @@ export class World {
         const a = (i / 8) * Math.PI * 2
         this.box(hp.x + Math.cos(a) * (hp.r + 1.9), 0, hp.z + Math.sin(a) * (hp.r + 1.9), 0.3, 0.25, 0.3, this.mats.ledWarm, false, false)
       }
+      // Gunship pad (sea mode).
+      const gp = GUNSHIP_PADS[base.team]
+      const gpad = new THREE.Mesh(new THREE.CircleGeometry(gp.r + 1.2, 40), new THREE.MeshStandardMaterial({ map: helipadTexture(TEAM_CSS[base.team], 'G'), roughness: 0.7 }))
+      gpad.rotation.x = -Math.PI / 2
+      gpad.position.set(gp.x, 0.05, gp.z)
+      gpad.receiveShadow = true
+      this.scene.add(gpad)
+      const gsign = this.label('武装直升机坪（出海模式）', 'Gunship pad (sea mode)', 0.9, { color: '#fff', bg: TEAM_CSS[base.team], size: 40, pad: 10 })
+      gsign.position.set(gp.x - s * (gp.r + 3), 3, gp.z)
+      this.scene.add(gsign)
       const icon = this.badge('直升机', 'HELI', TEAM_CSS[base.team], 1.8)
       icon.position.set(hp.x - s * (hp.r + 3), 3, hp.z)
       this.scene.add(icon)
@@ -904,6 +929,7 @@ export class World {
       STATIONS.some(s => Math.hypot(x - s.x, z - s.z) < s.r + 3) ||
       BASES.some(b => Math.hypot(x - b.x, z - b.z) < 16) ||
       HELIPADS.some(h => Math.hypot(x - h.x, z - h.z) < 11) ||
+      GUNSHIP_PADS.some(h => Math.hypot(x - h.x, z - h.z) < 10) ||
       Math.hypot(x, z) < 24 ||
       (Math.abs(x) < 9 && z < -6)
     for (const r of ROADS) {
@@ -936,6 +962,12 @@ export class World {
   }
 
   private boundary(): void {
+    // Sea limits: a ring of hazard buoys marks the edge of the playable harbour.
+    const buoyMat = new THREE.MeshStandardMaterial({ color: 0xff8a2a, emissive: 0xff6a00, emissiveIntensity: 0.35, roughness: 0.6 })
+    const edge: [number, number][] = []
+    for (let x = SEA.minX; x <= SEA.maxX; x += 24) edge.push([x, SEA.minZ])
+    for (let z = SEA.minZ + 24; z < SHORE_Z - 6; z += 24) edge.push([SEA.minX, z], [SEA.maxX, z])
+    for (const [x, z] of edge) this.box(x, WATER_Y - 0.5, z, 0.9, 1.5, 0.9, buoyMat, false, false)
     const fence = new THREE.MeshStandardMaterial({ color: 0x3a444e, roughness: 0.6, metalness: 0.4 })
     const hedge = new THREE.MeshStandardMaterial({ color: 0x4f7a43, roughness: 1 })
     this.box(LAND.minX - 0.5, 0, (SHORE_Z + LAND.maxZ) / 2, 1, 40, LAND.maxZ - SHORE_Z, fence, true, false).visible = false
@@ -1009,6 +1041,17 @@ export class World {
   }
 
   /** Per-frame ambient animation and sun/shadow follow. */
+  /** Billboard labels fade out when the camera gets close, so they never fill the screen. */
+  fadeLabels(cam: THREE.Vector3): void {
+    for (const l of this.labels) {
+      if (!(l.obj as THREE.Sprite).isSprite) continue
+      const o = l.obj as THREE.Sprite
+      if (!o.visible) continue
+      const d = o.getWorldPosition(tmpLabel).distanceTo(cam)
+      const near = l.h * 3, far = l.h * 6
+      o.material.opacity = Math.max(0, Math.min(1, (d - near) / (far - near)))
+    }
+  }
   animate(t: number, focus: THREE.Vector3): void {
     const pos = this.sea.geometry.attributes.position as THREE.BufferAttribute
     const arr = pos.array as Float32Array

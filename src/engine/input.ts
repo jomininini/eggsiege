@@ -4,7 +4,7 @@
  */
 export type Action =
   | 'jump' | 'sprint' | 'crouch' | 'reload' | 'interact' | 'grenade' | 'fire' | 'aim' | 'pause' | 'score'
-  | 'n1' | 'n2' | 'n3' | 'n4' | 'n5' | 'swap' | 'mode' | 'strike'
+  | 'n1' | 'n2' | 'n3' | 'n4' | 'n5' | 'n6' | 'swap' | 'mode' | 'strike'
 const KEY_BINDINGS: Partial<Record<Action, string[]>> = {
   jump: ['Space'],
   sprint: ['ShiftLeft', 'ShiftRight'],
@@ -22,6 +22,7 @@ const KEY_BINDINGS: Partial<Record<Action, string[]>> = {
   n3: ['Digit3', 'Numpad3'],
   n4: ['Digit4', 'Numpad4'],
   n5: ['Digit5', 'Numpad5'],
+  n6: ['Digit6', 'Numpad6'],
 }
 const MOVE_KEYS = { up: ['KeyW', 'ArrowUp'], down: ['KeyS', 'ArrowDown'], left: ['KeyA', 'ArrowLeft'], right: ['KeyD', 'ArrowRight'] }
 

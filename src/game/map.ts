@@ -10,7 +10,8 @@ import { L, type Txt } from './i18n'
 
 export const SHORE_Z = -78
 export const LAND = { minX: -130, maxX: 130, minZ: SHORE_Z, maxZ: 95 }
-export const SEA = { minX: -155, maxX: 155, minZ: -170, maxZ: SHORE_Z - 1.5 }
+/** Open sea: 1.5x the original 310 x 92 m (round 4). */
+export const SEA = { minX: -232, maxX: 232, minZ: -216, maxZ: SHORE_Z - 1.5 }
 export const WATER_Y = -1.2
 export const SEA_FLOOR = -1.55
 
@@ -19,7 +20,10 @@ export const LAKE = { x: 0, z: 0, r: 12 }
 /** Canal from the lake to the sea (runs north along x = 0). */
 export const CANAL = { halfW: 4.5, z0: SHORE_Z, z1: -Math.sqrt(LAKE.r * LAKE.r - 4.5 * 4.5) }
 /** 出海岛: raised sandy island off the promenade. */
-export const ISLAND = { x: 0, z: -128, rx: 30, rz: 17, y: 0.4 }
+/** Centre 100 m off the promenade (twice the original 50 m). */
+export const ISLAND = { x: 0, z: -178, rx: 30, rz: 17, y: 0.4 }
+/** Island-relative helper for everything placed on / around 出海岛. */
+const IZ = (dz: number): number => ISLAND.z + dz
 
 export const inIsland = (x: number, z: number, pad = 0): boolean => {
   const dx = (x - ISLAND.x) / (ISLAND.rx + pad), dz = (z - ISLAND.z) / (ISLAND.rz + pad)
@@ -42,11 +46,13 @@ export const POINTS: PointDef[] = [
   { id: 'egg', name: '金蛋 · 高锟会议中心', en: 'Golden Egg · Charles Kao Auditorium', short: '蛋', shortEn: 'EGG', kind: 'egg', x: 0, z: 0, r: 17, standX: 0, standZ: 14.5 },
   { id: '5e', name: '5E 大楼', en: 'Building 5E', short: 'C', shortEn: 'C', kind: 'building', x: 62, z: -36, r: 9, standX: 62, standZ: -36 },
   { id: 'hall', name: '大展览厅', en: 'Grand Exhibition Hall', short: 'D', shortEn: 'D', kind: 'building', x: 62, z: 46, r: 9, standX: 62, standZ: 46 },
-  { id: 'isle', name: '出海岛', en: 'Offshore Isle', short: '岛', shortEn: 'ISL', kind: 'island', x: 0, z: -127, r: 9, standX: 0, standZ: -127 },
+  { id: 'isle', name: '出海岛', en: 'Offshore Isle', short: '岛', shortEn: 'ISL', kind: 'island', x: 0, z: IZ(1), r: 9, standX: 0, standZ: IZ(1) },
 ]
 export const ISLAND_POINT = POINTS.length - 1
 /** Ammo depot on the Offshore Isle (sea mode): active for whichever team holds the isle. */
-export const ISLAND_DEPOT = { x: 6, z: -118.5, r: 3.6 }
+export const ISLAND_DEPOT = { x: 6, z: IZ(9.5), r: 3.6 }
+/** Helipad on the isle: transport helicopters land here, gunships land / rearm here when the isle is held. */
+export const ISLAND_HELIPAD = { x: 13, z: IZ(-5), r: 4.5, y: ISLAND.y }
 export const pointName = (p: PointDef): string => L(p.name, p.en)
 export const pointShort = (p: PointDef): string => L(p.short, p.shortEn)
 /** Number of active points for the chosen mode. */
@@ -110,6 +116,11 @@ export const HELIPADS = [
   { team: 0, x: -112, z: 48, r: 5 },
   { team: 1, x: 112, z: 48, r: 5 },
 ]
+/** Gunship pads beside the transport pads (sea mode). */
+export const GUNSHIP_PADS = [
+  { team: 0, x: -112, z: 66, r: 5 },
+  { team: 1, x: 112, z: 66, r: 5 },
+]
 export const CAR_SPAWNS = [
   { team: 0, x: -98, z: 25, yaw: Math.PI / 2 },
   { team: 1, x: 98, z: 25, yaw: -Math.PI / 2 },
@@ -127,23 +138,29 @@ export const BOAT_SPAWNS = [
   { team: 0, x: -107, z: -88, yaw: Math.PI / 2, sea: true },
   { team: 1, x: 107, z: -88, yaw: -Math.PI / 2, sea: true },
 ]
+/** High-speed landing craft moored at each pier head (sea mode): driver + 5 infantry. */
+export const LANDER_SPAWNS = [
+  { team: 0, x: -100, z: -102, yaw: Math.PI },
+  { team: 1, x: 100, z: -102, yaw: Math.PI },
+]
 /** Patrol boats at the island jetties; they belong to whoever holds 出海岛 (sea mode only). */
 export const ISLAND_BOATS = [
-  { x: -15, z: -104, yaw: 0 },
-  { x: 15, z: -104, yaw: 0 },
+  { x: -15, z: IZ(24), yaw: 0 },
+  { x: 15, z: IZ(24), yaw: 0 },
 ]
 export const ISLAND_JETTIES = [
-  { x: -10, z0: -114, z1: -105, w: 3 },
-  { x: 10, z0: -114, z1: -105, w: 3 },
+  { x: -10, z0: IZ(14), z1: IZ(23), w: 3 },
+  { x: 10, z0: IZ(14), z1: IZ(23), w: 3 },
 ]
 /** Where assault boats beach on the island (water approach + dry landing spot), per team. */
 export const BEACHES = [
-  { team: 0, wx: -37, wz: -127, lx: -26, lz: -127 },
-  { team: 1, wx: 37, wz: -127, lx: 26, lz: -127 },
+  { team: 0, wx: -37, wz: IZ(1), lx: -26, lz: IZ(1) },
+  { team: 1, wx: 37, wz: IZ(1), lx: 26, lz: IZ(1) },
 ]
 /** Canal route from the island jetties into the egg lake. */
 export const CANAL_ROUTE = [
-  { x: 0, z: -95 },
+  { x: 0, z: IZ(48) },
+  { x: 0, z: -100 },
   { x: 0, z: -82 },
   { x: 0, z: -62 },
   { x: 0, z: -36 },
@@ -152,9 +169,9 @@ export const CANAL_ROUTE = [
 ]
 export type EmplacementKind = 'aa' | 'arty'
 export const EMPLACEMENTS: { id: string; kind: EmplacementKind; x: number; z: number; yaw: number }[] = [
-  { id: 'aa-w', kind: 'aa', x: -17, z: -121, yaw: Math.PI },
-  { id: 'aa-e', kind: 'aa', x: 17, z: -121, yaw: Math.PI },
-  { id: 'arty', kind: 'arty', x: 0, z: -139, yaw: 0 },
+  { id: 'aa-w', kind: 'aa', x: -17, z: IZ(7), yaw: Math.PI },
+  { id: 'aa-e', kind: 'aa', x: 17, z: IZ(7), yaw: Math.PI },
+  { id: 'arty', kind: 'arty', x: 0, z: IZ(-11), yaw: 0 },
 ]
 /** Raised bridges over the canal (deck top height, span along x, width along z). */
 export const BRIDGES = [
@@ -173,5 +190,9 @@ export const ROADS: RoadDef[] = [
 /** @deprecated use isWater */
 export const isSea = isWater
 /** Where the helicopter can insert the player (and where the enemy calls strikes). */
-export const heliTargets = (count = POINTS.length - 1) =>
-  POINTS.slice(0, count).map((p, i) => ({ index: i, name: pointName(p), x: p.x, z: p.z + (p.kind === 'egg' ? 16 : 0) }))
+export type HeliTarget = { index: number; name: string; x: number; z: number; land: boolean; y: number }
+export const heliTargets = (count = POINTS.length - 1): HeliTarget[] =>
+  POINTS.slice(0, count).map((p, i) =>
+    p.kind === 'island'
+      ? { index: i, name: pointName(p), x: ISLAND_HELIPAD.x, z: ISLAND_HELIPAD.z, land: true, y: ISLAND_HELIPAD.y }
+      : { index: i, name: pointName(p), x: p.x, z: p.z + (p.kind === 'egg' ? 16 : 0), land: false, y: 0 })

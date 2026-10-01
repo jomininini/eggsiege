@@ -8,10 +8,11 @@ import { applyOptions, CONFIG, launcherName, pistolName, PLAYER_TEAM, RT, teamSh
 import { Drone, ScoutDrone } from './drone'
 import { Emplacement } from './emplace'
 import { Fx } from './fx'
+import { Gunship, type GunshipHost, type GunshipObjective } from './gunship'
 import { Heli, type HeliHost } from './heli'
 import { L } from './i18n'
 import {
-  BASES, BOAT_SPAWNS, CAR_SPAWNS, DRONE_PADS, EGG, EMPLACEMENTS, HELIPADS, ISLAND, ISLAND_BOATS, ISLAND_DEPOT, ISLAND_POINT, LAND, POINTS, SHORE_Z, SKILLS,
+  BASES, BOAT_SPAWNS, CAR_SPAWNS, DRONE_PADS, EGG, EMPLACEMENTS, HELIPADS, ISLAND, ISLAND_BOATS, ISLAND_DEPOT, ISLAND_POINT, LAND, LANDER_SPAWNS, POINTS, SHORE_Z, SKILLS,
   STATIONS, WATER_Y, heliTargets, isWater, pointName, pointShort, stationName, type SkillId,
 } from './map'
 import { NavGrid } from './nav'
@@ -69,7 +70,7 @@ const TEAM_HEX = ['#ff4d5e', '#3fa9ff']
 const NEUTRAL_HEX = '#e8edf2'
 const GOLD_HEX = '#ffd35c'
 
-export class Game implements BotHost, HeliHost, OrdnanceHost {
+export class Game implements BotHost, HeliHost, GunshipHost, OrdnanceHost {
   readonly scene = new THREE.Scene()
   readonly camera = new THREE.PerspectiveCamera(CONFIG.player.fov, 16 / 9, 0.05, 1600)
   readonly world: World
@@ -81,7 +82,9 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
   readonly viewModel = new ViewModel()
   bots: Bot[] = []
   readonly vehicles: Vehicle[] = []
+  /** Transport helicopters [red, blue] followed by the sea-mode gunships. */
   readonly helis: Heli[] = []
+  readonly gunships: Gunship[] = []
   readonly emps: Emplacement[] = []
   readonly scouts: ScoutDrone[] = []
   readonly strikes: Strike[] = []
@@ -102,6 +105,10 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
   private events: GameEvents | null = null
   private vehicle: Vehicle | null = null
   private heliRide: Heli | null = null
+  /** Gunship the player is flying. */
+  private gunship: Gunship | null = null
+  private recruitAt = 0
+  private isleToastAt = -99
   private seat: Emplacement | null = null
   private readonly cursor = new THREE.Vector3(0, 0, 0)
   private readonly cursorRing: THREE.Mesh
@@ -138,7 +145,13 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
     for (const s of CAR_SPAWNS) this.vehicles.push(new Vehicle('car', s.team, s, this.scene))
     for (const s of BOAT_SPAWNS) this.vehicles.push(new Vehicle('boat', s.team, s, this.scene))
     for (const s of ISLAND_BOATS) this.vehicles.push(new Vehicle('boat', -1, { team: -1, ...s }, this.scene, true))
+    for (const s of LANDER_SPAWNS) this.vehicles.push(new Vehicle('lander', s.team, s, this.scene))
     for (let t = 0; t < 2; t += 1) this.helis.push(new Heli(t, this.scene))
+    for (let t = 0; t < 2; t += 1) {
+      const g = new Gunship(t, this.scene)
+      this.gunships.push(g)
+      this.helis.push(g)
+    }
     for (let t = 0; t < 2; t += 1) this.scouts.push(new ScoutDrone(t, this.scene))
     const label = this.world.label.bind(this.world)
     for (const d of EMPLACEMENTS) this.emps.push(new Emplacement(d, this.scene, label))
@@ -184,7 +197,7 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
     for (const s of this.strikes) this.scene.remove(s.ring, s.disc)
     this.strikes.length = 0
     for (const v of this.vehicles) {
-      v.setEnabled(RT.sea || !(v.island || BOAT_SPAWNS.some(b => b.sea && b.x === v.spawn.x && b.z === v.spawn.z)))
+      v.setEnabled(RT.sea || !(v.island || v.kind === 'lander' || BOAT_SPAWNS.some(b => b.sea && b.x === v.spawn.x && b.z === v.spawn.z)))
       v.setTeam(v.island ? -1 : v.spawn.team)
       v.reset()
     }
@@ -199,6 +212,13 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
       h.parkNow()
       h.readyAt = 0
     }
+    for (const g of this.gunships) {
+      g.setEnabled(RT.sea)
+      g.reset(0)
+    }
+    this.gunship = null
+    this.recruitAt = 0
+    this.isleToastAt = -99
     if (this.drone.active) this.drone.land(0)
     this.drone.readyAt = 0
     this.enemyHeliAt = CONFIG.heli.enemyFirstCall
@@ -307,7 +327,7 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
           const since = this.idleSince.get(v) ?? this.time
           this.idleSince.set(v, since)
           const nearPlayer = this.player.alive && v.pos.distanceTo(this.player.pos) < 35
-          if (this.time - since > (v.kind === 'boat' ? 20 : 45) && !nearPlayer) {
+          if (this.time - since > (v.naval ? 20 : 45) && !nearPlayer && !v.passengers.length) {
             v.reset()
             this.idleSince.delete(v)
           }
@@ -334,7 +354,7 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
   /** Aircraft and hard targets the bots / AA can see this step. */
   private refreshTargets(): void {
     const air: Target[] = []
-    for (const h of this.helis) air.push({ team: h.team, alive: h.alive, airborne: h.airborne, pos: h.center.clone(), ref: h })
+    for (const h of this.helis) if (h.enabled) air.push({ team: h.team, alive: h.alive, airborne: h.airborne, pos: h.center.clone(), ref: h })
     if (this.drone.active) air.push({ team: this.drone.team, alive: true, airborne: true, pos: this.drone.pos, ref: this.drone })
     for (const s of this.scouts) if (s.active) air.push({ team: s.team, alive: true, airborne: true, pos: s.pos, ref: s })
     this.air = air
@@ -406,6 +426,7 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
       case 'vehicle': this.stepVehicle(dt, look); break
       case 'drone': this.stepDrone(dt, look); break
       case 'heli': this.stepHeliRide(dt, look); break
+      case 'gunship': this.stepGunship(dt, look); break
       case 'aa': this.stepAA(dt, look); break
       case 'arty': this.stepArty(dt, look); break
     }
@@ -449,7 +470,7 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
     if (this.heliMenu) {
       const pads = HELIPADS[PLAYER_TEAM]
       if (Math.hypot(p.pos.x - pads.x, p.pos.z - pads.z) > pads.r + 4) this.heliMenu = false
-      const choice = (['n1', 'n2', 'n3', 'n4', 'n5'] as const).findIndex(a => input.consume(a))
+      const choice = (['n1', 'n2', 'n3', 'n4', 'n5', 'n6'] as const).findIndex(a => input.consume(a))
       if (choice >= 0) this.boardHeli(choice)
     }
   }
@@ -645,11 +666,18 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
       this.prompt = wait > 0 ? L(`无人机充电中 ${Math.ceil(wait)} 秒`, `Drone charging ${Math.ceil(wait)}s`) : L(`按 E 起飞侦察无人机（${d.name}）`, `Press E to launch the recon drone (${d.en})`)
       return
     }
+    const gs = this.nearGunship()
+    if (gs) {
+      if (!gs.alive) this.prompt = L(`${gs.name} 已被击毁，等待重新部署`, `${gs.name} destroyed — awaiting replacement`)
+      else if (!gs.grounded || gs.pilot) this.prompt = L(`${gs.name} 正在出击，返航后可驾驶`, `${gs.name} is on a sortie — fly it once it lands`)
+      else this.prompt = L(`按 E 驾驶${gs.name}（耐久 ${Math.ceil(gs.hp)} · 火箭 ${gs.rockets}）`, `Press E to fly the ${gs.name} (armour ${Math.ceil(gs.hp)} · rockets ${gs.rockets})`)
+      return
+    }
     const hp = HELIPADS[PLAYER_TEAM]
     if (Math.hypot(p.pos.x - hp.x, p.pos.z - hp.z) < hp.r + 3 && p.pos.y < 2) {
       const h = this.helis[PLAYER_TEAM]
       const wait = h.readyAt - this.time
-      if (this.heliMenu) this.prompt = L('选择机降目标：', 'Choose insertion target: ') + heliTargets().map((tg, i) => `${i + 1} ${pointShort(POINTS[tg.index])}`).join(' · ') + L('（E 取消）', ' (E cancels)')
+      if (this.heliMenu) this.prompt = L('选择机降目标：', 'Choose insertion target: ') + this.heliChoices().map((tg, i) => `${i + 1} ${pointShort(POINTS[tg.index])}${tg.land ? L('(降落)', ' (lands)') : ''}`).join(' · ') + L('（E 取消）', ' (E cancels)')
       else if (h.busy) this.prompt = L('直升机执行任务中', 'Helicopter is on a mission')
       else if (wait > 0) this.prompt = L(`直升机整备中 ${Math.ceil(wait)} 秒`, `Helicopter rearming ${Math.ceil(wait)}s`)
       else this.prompt = L('按 E 登上直升机（机降 + 空中火力支援）', 'Press E to board the helicopter (air insertion + fire support)')
@@ -671,6 +699,20 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
     return best
   }
 
+  /** Own gunship within reach (on its pad, or wherever it was left). */
+  private nearGunship(): Gunship | null {
+    if (!RT.sea) return null
+    const p = this.player
+    for (const g of this.gunships) {
+      if (g.team !== p.team || !g.enabled) continue
+      if (Math.hypot(g.pos.x - p.pos.x, g.pos.z - p.pos.z) < 5.5 && Math.abs(g.pos.y - p.pos.y) < 3) return g
+    }
+    return null
+  }
+  /** Helicopter insertion targets; in sea mode the 出海岛 helipad (a real landing) is target 6. */
+  heliChoices() {
+    return heliTargets(RT.sea ? POINTS.length : POINTS.length - 1)
+  }
   private nearEmplacement(): Emplacement | null {
     if (!RT.sea) return null
     const p = this.player
@@ -705,6 +747,12 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
         return
       }
       this.enterSeat(e)
+      return
+    }
+    const gs = this.nearGunship()
+    if (gs) {
+      if (gs.board(p)) this.enterGunship(gs)
+      else this.sfx('deny')
       return
     }
     const pad = this.nearDronePad()
@@ -875,8 +923,9 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
   // ─── vehicles, helicopter, drone ────────────────────────────────────────
   private boardHeli(choice: number): void {
     const h = this.helis[PLAYER_TEAM]
-    const target = heliTargets()[choice]
-    if (!h.call({ insert: true, x: target.x, z: target.z, name: target.name }, this.time, this.player)) {
+    const target = this.heliChoices()[choice]
+    if (!target) return
+    if (!h.call({ insert: true, x: target.x, z: target.z, name: target.name, land: target.land, y: target.y }, this.time, this.player)) {
       this.sfx('deny')
       return
     }
@@ -885,12 +934,15 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
     this.player.mode = 'heli'
     this.player.sheltered = true
     this.sfx('heliCall')
-    this.toast(L(`直升机起飞，目标：${target.name}。可在舱门射击，按 E 提前跳伞`, `Lift-off to ${target.name}. Fire from the door, press E to jump early`), 'good')
+    this.toast(target.land
+      ? L(`直升机起飞，将降落在出海岛停机坪。可在舱门射击，按 E 提前跳伞`, `Lift-off: landing on the Offshore Isle helipad. Fire from the door, press E to jump early`)
+      : L(`直升机起飞，目标：${target.name}。可在舱门射击，按 E 提前跳伞`, `Lift-off to ${target.name}. Fire from the door, press E to jump early`), 'good')
   }
 
   private callHeliSupport(choice: number): void {
     const h = this.helis[PLAYER_TEAM]
-    const target = heliTargets()[choice]
+    const target = this.heliChoices()[choice]
+    if (!target) return
     if (!h.call({ insert: false, x: target.x, z: target.z, name: target.name }, this.time, null)) {
       this.toast(h.busy ? L('直升机正在执行任务', 'Helicopter is on a mission') : L(`直升机整备中 ${Math.ceil(h.readyAt - this.time)} 秒`, `Helicopter rearming ${Math.ceil(h.readyAt - this.time)}s`), 'bad')
       this.sfx('deny')
@@ -902,7 +954,9 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
 
   onHeliDrop(heli: Heli): void {
     if (heli.passenger !== this.player || this.player.mode !== 'heli') return
-    this.exitHeli(L('已机降：直升机将在上空提供火力支援', 'Inserted: the helicopter will circle and provide fire support'))
+    this.exitHeli(heli.mission?.land
+      ? L('直升机已降落出海岛：下机作战，直升机将起飞提供火力支援', 'Touched down on the Offshore Isle: deploy — the helicopter lifts off to give fire support')
+      : L('已机降：直升机将在上空提供火力支援', 'Inserted: the helicopter will circle and provide fire support'))
   }
 
   private exitHeli(msg: string): void {
@@ -910,7 +964,8 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
     const p = this.player
     if (!h) return
     h.seat(tmpV)
-    p.pos.set(tmpV.x, Math.max(tmpV.y - 1.5, 0), tmpV.z)
+    const gy = isWater(tmpV.x, tmpV.z) ? 0 : this.col.groundAt(tmpV.x, tmpV.z, 0.4, tmpV.y + 0.5)
+    p.pos.set(tmpV.x, Math.max(tmpV.y - 1.5, gy), tmpV.z)
     p.prev.copy(p.pos)
     p.vel.set(0, -1, 0)
     p.mode = 'foot'
@@ -952,6 +1007,161 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
     if (this.input.consume('interact')) this.exitHeli(L('跳伞！', 'Jump!'))
   }
 
+  // ─── gunship (player pilot) ─────────────────────────────────────────────
+  private enterGunship(g: Gunship): void {
+    const p = this.player
+    this.gunship = g
+    p.mode = 'gunship'
+    p.sheltered = true
+    p.ads = 0
+    p.lockT = 0
+    p.lockTarget = null
+    this.viewModel.setLock(0)
+    this.camYaw = g.yaw + Math.PI
+    this.camPitch = -0.18
+    this.sfx('vehicle')
+    this.toast(L(
+      `${g.name}：空格爬升 / C 下降，W/S/A/D 平移，鼠标转向，左键机炮，右键火箭弹；降落后按 E 离机。可降落在已占领的出海岛停机坪补给`,
+      `${g.name}: Space climb / C descend, WASD fly, mouse to turn, left click cannon, right click rockets; land and press E to exit. Rearm on the held Offshore Isle helipad`,
+    ), 'info')
+  }
+  private exitGunship(crashed = false): void {
+    const g = this.gunship
+    const p = this.player
+    if (!g) return
+    const c = Math.cos(g.yaw), s = Math.sin(g.yaw)
+    const x = g.pos.x + 2.4 * c, z = g.pos.z - 2.4 * s
+    const gy = isWater(x, z) ? Math.max(g.pos.y, WATER_Y) : this.col.groundAt(x, z, 0.4, g.pos.y + 2)
+    p.pos.set(x, crashed ? Math.max(gy, g.pos.y) : gy, z)
+    p.prev.copy(p.pos)
+    p.vel.set(0, crashed ? -2 : 0, 0)
+    p.yaw = this.camYaw
+    p.pitch = 0
+    p.mode = 'foot'
+    p.sheltered = false
+    p.onGround = false
+    g.leave(this.time)
+    this.gunship = null
+    this.audio.setEngine(0)
+  }
+  private stepGunship(_dt: number, look: { x: number; y: number }): void {
+    const g = this.gunship
+    const p = this.player
+    const input = this.input
+    if (!g || !g.alive || g.pilot !== p) {
+      if (g) this.exitGunship(true)
+      if (p.alive) this.damageUnit(p, 60, { team: 1 - p.team, name: L('坠机', 'crash') }, false, p.pos, L('坠机', 'crash'))
+      this.toast(L('武装直升机被击落，紧急弹射！', 'Gunship down — ejecting!'), 'bad')
+      return
+    }
+    const G = CONFIG.gunship
+    this.camYaw -= look.x
+    this.camPitch = Math.max(-1.0, Math.min(0.45, this.camPitch - look.y))
+    g.ctl.yaw = this.camYaw + Math.PI
+    g.ctl.fwd = input.move.y
+    g.ctl.strafe = input.move.x
+    g.ctl.up = (input.held('jump') ? 1 : 0) - (input.held('crouch') ? 1 : 0)
+    g.ctl.boost = input.held('sprint')
+    p.prev.copy(p.pos)
+    g.seat(tmpV)
+    p.pos.set(tmpV.x, tmpV.y - p.eyeY, tmpV.z)
+    p.vel.set(0, 0, 0)
+    this.audio.setEngine(0.35 + Math.min(1, Math.hypot(g.vel.x, g.vel.z) / G.speed) * 0.5, false)
+    if (!g.grounded) {
+      if (input.held('fire') && g.cannonCd <= 0) {
+        g.cannonCd = G.cannonInterval
+        const origin = this.camera.getWorldPosition(tmpV).clone()
+        const dir = this.aimDir(0.01)
+        const hit = this.col.raycast(origin, dir, G.cannonRange)
+        const aimPoint = origin.clone().addScaledVector(dir, hit ? hit.t : G.cannonRange)
+        const muzzle = g.muzzle(new THREE.Vector3())
+        const d2 = aimPoint.sub(muzzle).normalize()
+        p.shots += 1
+        this.fire({ team: p.team, name: p.name, unit: p }, muzzle, d2, G.cannonDamage, 0xffc46a, muzzle, true)
+        this.fx.shake = Math.max(this.fx.shake, 0.06)
+        this.sfx('gun')
+      }
+      if (input.held('aim') && g.rocketCd <= 0) {
+        if (g.rockets <= 0) {
+          if (input.consume('aim')) this.sfx('empty')
+          g.rocketCd = 0.6
+          this.toast(L('火箭弹耗尽：返回武装直升机坪或已占领的出海岛停机坪补给', 'Rockets spent: land on your gunship pad or the held Offshore Isle helipad to rearm'), 'bad')
+        } else {
+          g.rocketCd = G.rocketInterval
+          g.rockets -= 1
+          const origin = this.camera.getWorldPosition(tmpV).clone()
+          const dir = this.aimDir(0.006)
+          const hit = this.col.raycast(origin, dir, 400)
+          const aimPoint = origin.clone().addScaledVector(dir, hit ? hit.t : 400)
+          const from = g.pod(new THREE.Vector3())
+          this.gunshipRocket(g, from, aimPoint.sub(from).normalize())
+        }
+      }
+    }
+    const kmh = Math.round(Math.hypot(g.vel.x, g.vel.z) * 3.6)
+    const alt = Math.max(0, Math.round(g.pos.y))
+    if (g.grounded) {
+      const rearm = g.onRearmPad ? L(' · 补给中', ' · rearming') : ''
+      this.prompt = `${g.name} · ${L('已着陆', 'landed')}${rearm} · ${L('空格起飞 · 按 E 离机', 'Space to lift off · E to exit')}`
+      if (input.consume('interact')) {
+        this.exitGunship()
+        this.toast(L('已离开武装直升机', 'Left the gunship'), 'info')
+      }
+    } else {
+      this.prompt = `${g.name} · ${L('高度', 'alt')} ${alt} m · ${kmh} km/h · ${L('火箭', 'rockets')} ${g.rockets}/${G.rockets} · ${L('降落后按 E 离机', 'land, then E to exit')}`
+      if (input.consume('interact')) this.toast(L('先降落（按住 C 下降）才能离机', 'Land first (hold C to descend) before exiting'), 'info')
+    }
+    if (g.landedIsleAt > this.isleToastAt + 5) {
+      this.isleToastAt = g.landedIsleAt
+      this.toast(this.islandOwner() === p.team ? L('已降落出海岛停机坪：修理与火箭补给中', 'Landed on the Offshore Isle helipad: repairing and rearming') : L('已降落出海岛停机坪（占领出海岛后可补给）', 'Landed on the Offshore Isle helipad (rearm once the isle is ours)'), 'good')
+    }
+  }
+  // ─── gunship host (AI + rockets) ────────────────────────────────────────
+  gunshipHardTarget(team: number, near: THREE.Vector3, range: number): THREE.Vector3 | null {
+    let best: THREE.Vector3 | null = null
+    let bestD = range
+    const from = tmpV3.set(near.x, near.y + 0.5, near.z)
+    for (const h of this.hardware(team)) {
+      if (h.air) continue
+      const d = h.pos.distanceTo(from)
+      if (d < bestD && this.col.lineOfSight(from, h.pos)) {
+        bestD = d
+        best = h.pos.clone()
+      }
+    }
+    return best
+  }
+  gunshipObjective(team: number): GunshipObjective {
+    const m = this.match
+    const egg = eggIndex(m)
+    const isle = RT.sea ? ISLAND_POINT : -1
+    if (isle >= 0 && m.points[isle].owner !== team) return { x: ISLAND.x, z: ISLAND.z, name: pointName(POINTS[isle]), land: true }
+    if (m.points[egg].owner !== team) return { x: EGG.x, z: EGG.z + 6, name: pointName(POINTS[egg]), land: false }
+    const base = BASES[team]
+    let best = -1
+    let bestD = Infinity
+    POINTS.forEach((pt, i) => {
+      if (i === isle || m.points[i].owner === team) return
+      const d = Math.hypot(pt.x - base.x, pt.z - base.z)
+      if (d < bestD) {
+        bestD = d
+        best = i
+      }
+    })
+    if (best >= 0) return { x: POINTS[best].x, z: POINTS[best].z, name: pointName(POINTS[best]), land: false }
+    if (isle >= 0) return { x: ISLAND.x, z: ISLAND.z, name: pointName(POINTS[isle]), land: true }
+    return { x: EGG.x, z: EGG.z + 6, name: pointName(POINTS[egg]), land: false }
+  }
+  gunshipRocket(g: Gunship, from: THREE.Vector3, dir: THREE.Vector3): void {
+    const G = CONFIG.gunship
+    const owner: Shooter = g.pilot === this.player ? { team: g.team, name: this.player.name, unit: this.player } : { team: g.team, name: g.name }
+    this.ord.launch({
+      kind: 'rocket', from, dir, speed: G.rocketSpeed, turn: 0, owner, seeker: null,
+      life: 5, radius: G.rocketRadius, damage: G.rocketDamage * 0.6, direct: G.rocketDamage, weapon: L('机载火箭', 'gunship rockets'), gravity: -1.2,
+    })
+    this.fx.puff(from.clone(), 0.7, 0.8, 0xd9dcdf, 2, 0.2)
+    this.sfx('rocket', from)
+  }
   private enterVehicle(v: Vehicle): void {
     const p = this.player
     v.driver = p
@@ -982,7 +1192,7 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
       const probe = { x, y: g, z }
       this.col.pushOut(probe, 0.4, 1.75, 0.62)
       if (Math.hypot(probe.x - x, probe.z - z) >= 0.05) continue
-      if (v.kind === 'boat' && isWater(x, z) && g < -0.5) {
+      if (v.naval && isWater(x, z) && g < -0.5) {
         wet ??= new THREE.Vector3(x, g, z)
         continue
       }
@@ -1001,7 +1211,13 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
     p.mode = 'foot'
     p.sheltered = false
     this.audio.setEngine(0)
-    if (v.kind === 'boat' && isWater(p.pos.x, p.pos.z)) this.toast(L('涉水登陆：向岸边或台阶前进即可上岸', 'Wading ashore: head for the bank or the steps'), 'info')
+    if (v.passengers.length) {
+      const n = v.passengers.length
+      this.unload(v, p.pos.x, p.pos.z)
+      this.toast(L(`${n} 名友军随你登陆`, `${n} allies landed with you`), 'good')
+    }
+    for (const b of this.bots) if (b.boardingFor === v) b.cancelBoard()
+    if (v.naval && isWater(p.pos.x, p.pos.z)) this.toast(L('涉水登陆：向岸边或台阶前进即可上岸', 'Wading ashore: head for the bank or the steps'), 'info')
   }
 
   private stepVehicle(dt: number, look: { x: number; y: number }): void {
@@ -1015,7 +1231,8 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
     if (!this.vehicle) return
     p.prev.copy(p.pos)
     p.pos.copy(v.pos)
-    this.audio.setEngine(Math.min(1, Math.abs(v.speed) / 20) * 0.8 + 0.2, v.kind === 'boat')
+    this.audio.setEngine(Math.min(1, Math.abs(v.speed) / 20) * 0.8 + 0.2, v.naval)
+    if (v.kind === 'lander') this.recruitPassengers(v)
     // Ramming.
     if (v.kind === 'car' && Math.abs(v.speed) > 7) {
       for (const u of this.units) {
@@ -1030,7 +1247,7 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
       }
     }
     // Mounted gun.
-    const cfg = v.kind === 'car' ? CONFIG.car : CONFIG.boat
+    const cfg = v.cfg
     v.gunCd -= dt
     if (input.held('fire') && v.gunCd <= 0) {
       v.gunCd = cfg.gunInterval
@@ -1046,11 +1263,14 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
       this.sfx('gun')
     }
     let nearShore = false
-    if (v.kind === 'boat') {
+    if (v.naval) {
       for (const [ox, oz] of [[5, 0], [-5, 0], [0, 5], [0, -5]]) if (!isWater(v.pos.x + ox, v.pos.z + oz)) nearShore = true
     }
     const kmh = Math.round(Math.abs(v.speed) * 3.6)
-    this.prompt = `${v.label} · ${L('速度', 'speed')} ${kmh} km/h · ${L('耐久', 'armour')} ${Math.ceil(v.hp)}/${v.maxHp}${nearShore ? L(' · 已靠岸，按 E 登陆', ' · at the shore, E to land') : L(' · 按 E 下车', ' · E to exit')}`
+    const crew = v.kind === 'lander'
+      ? ` · ${L('载员', 'troops')} ${v.passengers.length}/${v.seats}${Math.abs(v.speed) < 2 && Math.hypot(v.pos.x - v.spawn.x, v.pos.z - v.spawn.z) < 15 && v.freeSeats > 0 ? L('（友军登艇中）', ' (allies boarding)') : ''}`
+      : ''
+    this.prompt = `${v.label} · ${L('速度', 'speed')} ${kmh} km/h · ${L('耐久', 'armour')} ${Math.ceil(v.hp)}/${v.maxHp}${crew}${nearShore ? L(' · 已靠岸，按 E 登陆', ' · at the shore, E to land') : L(' · 按 E 下车', ' · E to exit')}`
     if (input.consume('interact')) this.exitVehicle()
   }
 
@@ -1067,7 +1287,7 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
     const artyOk = RT.sea && arty && arty.enabled && arty.alive && arty.team === p.team
     const artyTxt = artyOk ? (this.time >= arty.readyAt ? L(' · B 火箭炮轰炸此处', ' · B rocket strike here') : L(` · 火箭炮 ${Math.ceil(arty.readyAt - this.time)} 秒`, ` · rockets ${Math.ceil(arty.readyAt - this.time)}s`)) : ''
     this.prompt = L(`无人机侦察 · 剩余 ${Math.ceil(left)} 秒 · 已标记敌人 ${n} · 1-5 直升机支援`, `Drone recon · ${Math.ceil(left)}s left · ${n} enemies marked · 1-5 heli support`) + artyTxt + L(' · E 返回', ' · E return')
-    const choice = (['n1', 'n2', 'n3', 'n4', 'n5'] as const).findIndex(a => this.input.consume(a))
+    const choice = (['n1', 'n2', 'n3', 'n4', 'n5', 'n6'] as const).findIndex(a => this.input.consume(a))
     if (choice >= 0) this.callHeliSupport(choice)
     if (this.input.consume('strike')) {
       if (!RT.sea) this.toast(L('远程轰炸需在出海模式中占领出海岛', 'Rocket strikes need the Offshore Isle (sea mode)'), 'bad')
@@ -1143,7 +1363,7 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
       }
     }
     for (const h of this.helis) {
-      if (h.team === team || !h.airborne) continue
+      if (h.team === team || !this.heliHittable(h)) continue
       const t = h.rayHit(o, d, best)
       if (t >= 0 && t < best) {
         best = t
@@ -1286,7 +1506,15 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
     v.hp = 0
     const driver = v.driver
     v.destroy()
-    v.respawnAt = this.time + (v.kind === 'car' ? CONFIG.car.respawn : CONFIG.boat.respawn)
+    v.respawnAt = this.time + v.cfg.respawn
+    // Troops on deck are thrown into the sea.
+    for (const u of v.passengers) {
+      if (!(u instanceof Bot) || !u.alive) continue
+      u.passengerOf = null
+      u.pos.y = WATER_Y - 1.1
+      this.damageUnit(u, 70, by, false, v.pos, L('载具爆炸', 'vehicle explosion'))
+    }
+    v.passengers = []
     this.fx.explosion(v.center.clone(), 1.2)
     this.sfx('explode', v.pos)
     this.splash(v.center, 5, 60, by)
@@ -1328,6 +1556,7 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
     if (u instanceof Bot) return u.ride ? { pos: u.ride.v.pos, center: u.ride.v.center, ref: u.ride.v } : null
     if (u !== this.player) return null
     if (this.vehicle) return { pos: this.vehicle.pos, center: this.vehicle.center, ref: this.vehicle }
+    if (this.gunship) return { pos: this.gunship.pos, center: this.gunship.center.clone(), ref: this.gunship }
     if (this.heliRide) return { pos: this.heliRide.pos, center: this.heliRide.center.clone(), ref: this.heliRide }
     return null
   }
@@ -1634,7 +1863,46 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
 
   // ─── bot host (boats) ───────────────────────────────────────────────────
   get boats(): Vehicle[] {
-    return this.vehicles.filter(v => v.kind === 'boat' && v.enabled)
+    return this.vehicles.filter(v => v.naval && v.enabled)
+  }
+  boardPassenger(bot: Bot, v: Vehicle): boolean {
+    if (!v.alive || v.freeSeats <= 0 || v.passengers.includes(bot)) return false
+    v.passengers.push(bot)
+    bot.passengerOf = v
+    return true
+  }
+  unload(v: Vehicle, x: number, z: number): void {
+    const list = v.passengers
+    v.passengers = []
+    list.forEach((u, i) => {
+      if (!(u instanceof Bot)) return
+      u.passengerOf = null
+      if (!u.alive) return
+      const a = (i / Math.max(1, list.length)) * Math.PI * 2
+      let px = x + Math.cos(a) * 2.2, pz = z + Math.sin(a) * 2.2
+      if (isWater(px, pz) && !isWater(x, z)) {
+        px = x
+        pz = z
+      }
+      const g = isWater(px, pz) ? WATER_Y - 1.1 : this.col.groundAt(px, pz, 0.4, 20)
+      u.pos.set(px, g, pz)
+      u.prev.copy(u.pos)
+      u.afterUnload(this)
+    })
+  }
+  /** While the player holds a landing craft at its pier, nearby friendly infantry climb aboard. */
+  private recruitPassengers(v: Vehicle): void {
+    if (this.time < this.recruitAt) return
+    this.recruitAt = this.time + 1
+    if (Math.abs(v.speed) > 2 || v.freeSeats <= 0 || Math.hypot(v.pos.x - v.spawn.x, v.pos.z - v.spawn.z) > 15) return
+    let want = v.freeSeats - this.bots.filter(b => b.boardingFor === v).length
+    for (const b of this.bots) {
+      if (want <= 0) break
+      if (b.team !== this.player.team || !b.alive || b.ride || b.passengerOf || b.boardingFor) continue
+      // Skip swimmers (standing on a pier deck over water is fine).
+      if (Math.hypot(b.pos.x - v.pos.x, b.pos.z - v.pos.z) > 45 || (isWater(b.pos.x, b.pos.z) && b.pos.y < -0.3)) continue
+      if (b.orderBoard(this, v)) want -= 1
+    }
   }
   board(bot: Bot, v: Vehicle): void {
     v.driver = bot
@@ -1715,7 +1983,7 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
       if (d < radius + 2) this.damageVehicle(v, damage * 1.6 * (1 - d / (radius + 2)), by)
     }
     for (const h of this.helis) {
-      if (h.team === by.team || !h.airborne || h === skip) continue
+      if (h.team === by.team || !this.heliHittable(h) || h === skip) continue
       const d = h.center.distanceTo(c)
       if (d < radius + 4) h.damage(damage * 1.4 * (1 - d / (radius + 4)), this)
     }
@@ -1949,12 +2217,24 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
     } else if (p.mode === 'vehicle' && this.vehicle) {
       const v = this.vehicle
       const vp = tmpV.lerpVectors(v.prev, v.pos, alpha)
-      const dist = v.kind === 'boat' ? 11 : 9
+      const dist = v.kind === 'lander' ? 13 : v.kind === 'boat' ? 11 : 9
       const cy = Math.cos(this.camPitch)
       cam.position.set(vp.x + Math.sin(this.camYaw) * dist * cy, vp.y + 3 - Math.sin(this.camPitch) * dist, vp.z + Math.cos(this.camYaw) * dist * cy)
-      cam.position.y = Math.max(cam.position.y, (v.kind === 'boat' ? WATER_Y : vp.y) + 1)
+      cam.position.y = Math.max(cam.position.y, (v.naval ? WATER_Y : vp.y) + 1)
       cam.lookAt(vp.x, vp.y + 2.2, vp.z)
       fovTarget = 70
+    } else if (p.mode === 'gunship' && this.gunship) {
+      const g = this.gunship
+      const gp = tmpV.lerpVectors(g.prev, g.pos, alpha)
+      const dist = 15
+      const cy = Math.cos(this.camPitch)
+      cam.position.set(gp.x + Math.sin(this.camYaw) * dist * cy, gp.y + 4.5 - Math.sin(this.camPitch) * dist, gp.z + Math.cos(this.camYaw) * dist * cy)
+      const floor = isWater(cam.position.x, cam.position.z) ? WATER_Y + 1 : this.col.groundAt(cam.position.x, cam.position.z, 0.3, cam.position.y + 1) + 1
+      cam.position.y = Math.max(cam.position.y, floor)
+      // Look past the helicopter along the aim so the crosshair marks where the cannon hits.
+      tmpV2.set(-Math.sin(this.camYaw) * cy, Math.sin(this.camPitch), -Math.cos(this.camYaw) * cy)
+      cam.lookAt(gp.x + tmpV2.x * 40, gp.y + 3 + tmpV2.y * 40, gp.z + tmpV2.z * 40)
+      fovTarget = this.input.held('aim') ? 62 : 72
     } else if (p.mode === 'drone') {
       const d = this.drone
       const dp = tmpV.lerpVectors(d.prev, d.pos, alpha)
@@ -2002,6 +2282,7 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
     for (const b of this.bots) b.mesh.root.visible = !b.ride && (b.alive || this.time - (b.respawnAt - CONFIG.bots.respawn) < 4)
     const focus = this.state === 'title' ? new THREE.Vector3(0, 0, 0) : p.mode === 'drone' ? this.drone.pos.clone().setY(0) : p.mode === 'arty' ? this.cursor.clone() : p.pos
     this.world.animate(t, focus)
+    this.world.fadeLabels(cam.position)
     this.renderer.render(this.scene, cam)
   }
 
@@ -2059,7 +2340,10 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
     for (const hh of this.helis) {
       if (!hh.airborne || !hh.alive) continue
       const r = proj(tmpV.copy(hh.pos).setY(hh.pos.y + 5), hh.team !== p.team)
-      if (r) out.push({ ...r, kind: 'heli', label: hh.team === p.team ? L('友军直升机', 'friendly heli') : L('敌方直升机', 'enemy heli'), color: TEAM_HEX[hh.team], dist: hh.pos.distanceTo(camPos) })
+      if (hh === this.gunship) continue
+      const gun = hh instanceof Gunship
+      const label = hh.team === p.team ? (gun ? L('友军武装直升机', 'friendly gunship') : L('友军直升机', 'friendly heli')) : gun ? L('敌方武装直升机', 'enemy gunship') : L('敌方直升机', 'enemy heli')
+      if (r) out.push({ ...r, kind: 'heli', label, color: TEAM_HEX[hh.team], dist: hh.pos.distanceTo(camPos) })
     }
     for (const s of this.scouts) {
       if (!s.active) continue
@@ -2119,6 +2403,23 @@ export class Game implements BotHost, HeliHost, OrdnanceHost {
 
   get activeVehicle(): Vehicle | null {
     return this.vehicle
+  }
+  /** Heading of the gunship the player flies (minimap arrow). */
+  get gunshipYaw(): number | null {
+    return this.gunship ? this.gunship.yaw + Math.PI : null
+  }
+  /** Airborne helicopters, plus gunships sitting on the ground (they can be destroyed landed). */
+  private heliHittable(h: Heli): boolean {
+    return h.airborne || (h instanceof Gunship && h.enabled && h.alive)
+  }
+  /** Gunship HUD data while the player flies one. */
+  gunshipStatus(): { name: string; hp: number; maxHp: number; rockets: number; maxRockets: number; alt: number; kmh: number; grounded: boolean } | null {
+    const g = this.gunship
+    if (!g) return null
+    return {
+      name: g.name, hp: g.hp, maxHp: g.maxHp, rockets: g.rockets, maxRockets: CONFIG.gunship.rockets,
+      alt: Math.max(0, Math.round(g.pos.y)), kmh: Math.round(Math.hypot(g.vel.x, g.vel.z) * 3.6), grounded: g.grounded,
+    }
   }
 
   /** Emplacement status for the HUD while operating one. */

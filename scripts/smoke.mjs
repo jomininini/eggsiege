@@ -13,7 +13,7 @@ mkdirSync(out, { recursive: true })
 const server = external ? null : spawn(process.execPath, ['node_modules/vite/bin/vite.js', 'preview', '--port', String(port), '--strictPort', '--host', '127.0.0.1'], { stdio: 'ignore' })
 let browser
 const errors = []
-const guard = setTimeout(() => fail('timed out'), 600_000)
+const guard = setTimeout(() => fail('timed out'), 1_200_000)
 function cleanup() {
   clearTimeout(guard)
   try { server?.kill('SIGTERM') } catch {}
@@ -317,6 +317,83 @@ try {
   const dep = await page.evaluate(() => ({ res: window.__game.game.player.reserve, mag: window.__game.game.player.mag }))
   log('depot', JSON.stringify(dep))
   if (!(dep.res >= 60) || !Number.isInteger(dep.res)) throw new Error('isle depot did not resupply: ' + JSON.stringify(dep))
+  // Landing craft: hold at the pier, friendly infantry climb aboard, then sail with them.
+  await page.evaluate(() => {
+    const { game } = window.__game
+    const v = game.vehicles.find(v => v.kind === 'lander' && v.team === 0)
+    game.debugTeleport(v.pos.x, v.pos.z + 3.8, 0.6)
+    let n = 0
+    for (const b of game.bots) {
+      if (b.team !== 0 || n >= 2) continue
+      if (b.ride) { if (b.ride.v.driver === b) b.ride.v.driver = null; b.ride = null }
+      if (!b.alive) b.spawn(game)
+      b.alive = true; b.hp = b.maxHp ?? 100; b.sheltered = false; b.passengerOf = null; b.cancelBoard()
+      b.pos.set(v.pos.x - 1 + 2 * n, 0.6, -86); b.prev.copy(b.pos); b.path = []; b.goal = null; b.nextThink = 0; n += 1
+    }
+  })
+  await sim(0.4)
+  await press('KeyE')
+  const ld0 = await page.evaluate(() => ({ mode: window.__game.game.player.mode, kind: window.__game.game.activeVehicle?.kind }))
+  if (ld0.mode !== 'vehicle' || ld0.kind !== 'lander') throw new Error('could not board the landing craft: ' + JSON.stringify(ld0) + ' ' + (await st()).prompt)
+  await sim(12)
+  const crew = await page.evaluate(() => window.__game.game.activeVehicle.passengers.length)
+  log('lander crew', crew)
+  if (crew < 1) throw new Error('no infantry boarded the landing craft: ' + JSON.stringify(await page.evaluate(() => { const g = window.__game.game; const v = g.activeVehicle; return { v: v && [v.pos.x, v.pos.z, v.speed, v.freeSeats], t: g.time, bots: g.bots.filter(b => b.team === 0).map(b => ({ p: [Math.round(b.pos.x), Math.round(b.pos.y), Math.round(b.pos.z)], alive: b.alive, ride: !!b.ride, bf: !!b.boardingFor, po: !!b.passengerOf, nt: Math.round(b.nextThink - g.time) })) } })))
+  await hold('KeyW', 2.5)
+  const ld1 = await page.evaluate(() => ({ speed: window.__game.game.activeVehicle.speed, crew: window.__game.game.activeVehicle.passengers.length }))
+  log('lander', JSON.stringify(ld1))
+  await page.screenshot({ path: `${out}/19-lander.png` })
+  if (!(Math.abs(ld1.speed) > 10) || ld1.crew < 1) throw new Error('landing craft did not sail with its troops: ' + JSON.stringify(ld1))
+  await press('KeyE')
+  await sim(0.3)
+  const ld2 = await page.evaluate(() => window.__game.game.bots.filter(b => b.passengerOf).length)
+  if (ld2 !== 0) throw new Error('passengers were not unloaded on exit')
+  // Gunship: take off from its pad, fire cannon + rockets, land on the held isle helipad.
+  await page.evaluate(() => { const { game } = window.__game; const g = game.gunships[0]; g.reset(game.time); g.sortieAt = 1e9; game.debugTeleport(g.pos.x + 3.5, g.pos.z, g.pos.y) })
+  await sim(0.4)
+  await press('KeyE')
+  if ((await st()).mode !== 'gunship') throw new Error('could not fly the gunship: ' + (await st()).prompt)
+  await hold('Space', 3)
+  await hold('KeyW', 1.5)
+  const gs0 = await page.evaluate(() => window.__game.game.gunshipStatus())
+  log('gunship', JSON.stringify(gs0))
+  if (!(gs0.alt > 6) || gs0.grounded) throw new Error('gunship did not take off')
+  const shotsG = await page.evaluate(() => window.__game.game.player.shots)
+  await page.mouse.down()
+  await sim(0.5)
+  await page.mouse.up()
+  await page.mouse.down({ button: 'right' })
+  await sim(0.7)
+  await page.mouse.up({ button: 'right' })
+  const gs1 = await page.evaluate(() => ({ s: window.__game.game.gunshipStatus(), shots: window.__game.game.player.shots }))
+  log('gunship fire', JSON.stringify(gs1))
+  if (!(gs1.shots > shotsG) || !(gs1.s.rockets < gs1.s.maxRockets)) throw new Error('gunship weapons did not fire')
+  await page.screenshot({ path: `${out}/20-gunship.png` })
+  await page.evaluate(() => { const { game, map } = window.__game; const g = game.gunships[0]; const h = map.ISLAND_HELIPAD; g.pos.set(h.x, 7, h.z); g.prev.copy(g.pos); g.vel.set(0, 0, 0) })
+  await hold('KeyC', 2.5)
+  await sim(2)
+  const gs2 = await page.evaluate(() => ({ s: window.__game.game.gunshipStatus(), pad: window.__game.game.gunships[0].onRearmPad }))
+  log('gunship isle', JSON.stringify(gs2))
+  await page.screenshot({ path: `${out}/21-gunship-isle.png` })
+  if (!gs2.s.grounded || !gs2.pad) throw new Error('gunship did not land / rearm on the isle helipad: ' + JSON.stringify(gs2))
+  await press('KeyE')
+  const gs3 = await st()
+  if (gs3.mode !== 'foot' || !(gs3.pos.z < -150)) throw new Error('could not leave the gunship on the isle: ' + JSON.stringify(gs3))
+  // Transport helicopter: target 6 lands on the isle helipad.
+  await page.evaluate(() => { const { game, map } = window.__game; const hp = map.HELIPADS[0]; const h0 = game.helis[0]; h0.readyAt = 0; h0.maxHp = h0.hp = 1e6; const eg = game.gunships[1]; eg.reset(game.time); eg.sortieAt = 1e9; for (const b of game.bots) if (b.team === 1) { b.alive = false; b.respawnAt = 1e9; if (b.ride) { b.ride.v.driver = null; b.ride = null } } game.debugTeleport(hp.x + 2, hp.z, 0) })
+  await sim(0.4)
+  await press('KeyE')
+  await press('Digit6')
+  if ((await st()).mode !== 'heli') throw new Error('heli target 6 not accepted: ' + (await st()).prompt)
+  let landed = null
+  for (let i = 0; i < 12 && !landed; i += 1) {
+    await sim(4)
+    const s = await st()
+    if (s.mode === 'foot') landed = s
+  }
+  log('heli isle', JSON.stringify(landed), JSON.stringify(await page.evaluate(() => { const h = window.__game.game.helis[0]; return { alive: h.alive, phase: h.phase, hp: h.hp, pos: [h.pos.x, h.pos.y, h.pos.z] } })))
+  if (!landed || !(landed.pos.z < -160) || !(landed.pos.y > 0.2)) throw new Error('heli did not land the player on the isle: ' + JSON.stringify(landed))
+  await page.screenshot({ path: `${out}/22-heli-isle.png` })
   // Regression: stale time gates from a previous match must not block firing after a restart.
   await page.evaluate(() => { const g = window.__game.game; g.player.nextFire = 9999; for (const b of g.bots) b.nextShot = 9999; g.debugForceEnd?.(0) })
   await page.evaluate(() => window.__game.start())
