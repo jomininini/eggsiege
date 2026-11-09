@@ -1,11 +1,12 @@
 import * as MapData from './game/map'
 import './styles/main.css'
 import { Audio } from './engine/audio'
+import { showBootError } from './engine/boot-error'
 import { Input } from './engine/input'
 import { GameLoop } from './engine/loop'
 import { SaveStore, type SaveData } from './engine/save'
 import type { Game } from './game/game'
-import { onLang, setLang } from './game/i18n'
+import { getLang, onLang, setLang } from './game/i18n'
 import { Account } from './net/account'
 import { Ui } from './ui/ui'
 declare global {
@@ -143,4 +144,4 @@ async function boot(): Promise<void> {
   window.__game = { game, input, ui, account, start: startMatch, map: MapData }
 }
 
-void boot()
+void boot().catch(error => showBootError(error, getLang() === 'en'))

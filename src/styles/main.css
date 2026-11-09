@@ -129,6 +129,10 @@ kbd {
 .boot-card { text-align: center; }
 .boot-card h1 { font-size: 2.6em; margin: 16px 0 6px; letter-spacing: 0.2em; }
 .boot-card p { color: var(--mute); margin: 0 0 18px; }
+.boot-error .boot-card { width: min(680px, 92vw); padding: 24px; }
+.boot-error h1 { font-size: clamp(24px, 4vw, 38px); letter-spacing: 0.02em; }
+.boot-error p { line-height: 1.6; }
+.boot-error pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 30vh; overflow: auto; color: #ffbaae; }
 .logo-egg {
   width: 84px; height: 56px; margin: 0 auto;
   border-radius: 50%;
